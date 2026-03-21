@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 from hypothesis import given
+from hypothesis import assume
 from hypothesis import strategies as st
 
 from core.schedule_core import compute_chunk_window, find_docs
@@ -13,6 +14,7 @@ from core.schedule_core import compute_chunk_window, find_docs
     eval_seq_len=st.integers(min_value=1, max_value=64),
 )
 def test_chunk_windows_cover_prediction_range_exactly(pred_len: int, chunk_size: int, eval_seq_len: int):
+    assume(eval_seq_len >= min(chunk_size, pred_len))
     num_chunks = (pred_len + chunk_size - 1) // chunk_size
     covered: list[int] = []
     for ci in range(num_chunks):

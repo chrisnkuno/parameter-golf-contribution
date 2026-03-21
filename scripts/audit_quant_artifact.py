@@ -3,11 +3,16 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import sys
 
 import torch
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 from core.artifact_core import build_packed_quantized_state_dict, serialize_quant_artifact
-from core.quant_core import quantize_state_dict_int8
+from core.quant_core import quantize_state_dict_int8, tensor_nbytes
 
 
 def parse_args() -> argparse.Namespace:
@@ -75,6 +80,32 @@ def main() -> None:
         "checkpoint": str(args.state_dict_path),
         "baseline_tensor_bytes": quant_stats["baseline_tensor_bytes"],
         "int8_payload_bytes": quant_stats["int8_payload_bytes"],
+        "top_quantized_tensors": [
+            {
+                "name": name,
+                "nbytes": tensor_nbytes(tensor),
+                "shape": list(tensor.shape),
+                "scale_nbytes": tensor_nbytes(quant_obj["scales"][name]),
+            }
+            for name, tensor in sorted(
+                quant_obj["quantized"].items(),
+                key=lambda item: tensor_nbytes(item[1]),
+                reverse=True,
+            )[:20]
+        ],
+        "top_passthrough_tensors": [
+            {
+                "name": name,
+                "nbytes": tensor_nbytes(tensor),
+                "shape": list(tensor.shape),
+                "dtype": str(tensor.dtype),
+            }
+            for name, tensor in sorted(
+                quant_obj["passthrough"].items(),
+                key=lambda item: tensor_nbytes(item[1]),
+                reverse=True,
+            )[:20]
+        ],
         "reports": reports,
     }
     print(json.dumps(summary, indent=2, sort_keys=True))

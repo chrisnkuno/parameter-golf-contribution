@@ -7,7 +7,12 @@ import torch
 from hypothesis import given
 from hypothesis import strategies as st
 
-from core.metric_core import compute_loss_byte_deltas, compute_token_bytes, compute_val_bpb, finalize_eval_result
+from core.metric_core import (
+    compute_loss_byte_deltas,
+    compute_token_bytes,
+    compute_val_bpb,
+    finalize_eval_result,
+)
 
 
 @st.composite

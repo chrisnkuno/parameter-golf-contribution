@@ -33,8 +33,17 @@ from torch.backends.cuda import (
 )
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from core.metric_core import EvalResult, compute_loss_byte_deltas, compute_token_bytes, finalize_eval_result
-from core.quant_core import CONTROL_TENSOR_NAME_PATTERNS, dequantize_state_dict_int8, quantize_state_dict_int8
+from core.metric_core import (
+    EvalResult,
+    compute_loss_byte_deltas,
+    compute_token_bytes,
+    finalize_eval_result,
+)
+from core.quant_core import (
+    CONTROL_TENSOR_NAME_PATTERNS,
+    dequantize_state_dict_int8,
+    quantize_state_dict_int8,
+)
 from core.schedule_core import compute_chunk_window, find_docs
 
 # -----------------------------

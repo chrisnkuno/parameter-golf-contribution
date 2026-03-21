@@ -38,6 +38,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mlp-hidden", type=int, default=0)
     parser.add_argument("--num-shared-blocks", type=int, default=0)
     parser.add_argument("--num-untied-tail-blocks", type=int, default=0)
+    parser.add_argument("--xsa-tail-layers", type=int, default=0)
     parser.add_argument("--tie-embeddings", type=int, default=1)
     parser.add_argument("--tokenizer-path", type=str, default="./data/tokenizers/fineweb_1024_bpe.model")
     parser.add_argument("--data-path", type=str, default="./data/datasets/fineweb10B_sp1024")
@@ -61,6 +62,7 @@ def build_args(cli: argparse.Namespace) -> tg.Hyperparameters:
     args.mlp_hidden = cli.mlp_hidden
     args.num_shared_blocks = cli.num_shared_blocks
     args.num_untied_tail_blocks = cli.num_untied_tail_blocks
+    args.xsa_tail_layers = cli.xsa_tail_layers
     args.tie_embeddings = bool(cli.tie_embeddings)
     args.eval_mode = "flat"
     args.eval_seq_len = cli.train_seq_len
@@ -114,6 +116,7 @@ def main() -> None:
         mlp_hidden=args.mlp_hidden,
         num_shared_blocks=args.num_shared_blocks,
         num_untied_tail_blocks=args.num_untied_tail_blocks,
+        xsa_tail_layers=args.xsa_tail_layers,
         tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
@@ -159,6 +162,7 @@ def main() -> None:
                 "mlp_hidden": cli.mlp_hidden,
                 "num_shared_blocks": cli.num_shared_blocks,
                 "num_untied_tail_blocks": cli.num_untied_tail_blocks,
+                "xsa_tail_layers": cli.xsa_tail_layers,
                 "artifact_raw_serialized_bytes": raw_len,
                 "artifact_compressed_bytes": len(artifact_blob),
                 "int8_payload_bytes": quant_stats["int8_payload_bytes"],

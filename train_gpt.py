@@ -97,6 +97,7 @@ class Hyperparameters:
     mlp_hidden = int(os.environ.get("MLP_HIDDEN", 0))
     num_shared_blocks = int(os.environ.get("NUM_SHARED_BLOCKS", 0))
     num_untied_tail_blocks = int(os.environ.get("NUM_UNTIED_TAIL_BLOCKS", 0))
+    xsa_tail_layers = int(os.environ.get("XSA_TAIL_LAYERS", 0))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -123,6 +124,7 @@ class Hyperparameters:
     ttt_chunk_size = int(os.environ.get("TTT_CHUNK_SIZE", 256))
     ttt_eval_seq_len = int(os.environ.get("TTT_EVAL_SEQ_LEN", 1024))
     ttt_batch_size = int(os.environ.get("TTT_BATCH_SIZE", 64))
+    run_ttt_eval = bool(int(os.environ.get("RUN_TTT_EVAL", "1")))
     quant_artifact_format = os.environ.get("QUANT_ARTIFACT_FORMAT", DEFAULT_QUANT_ARTIFACT_FORMAT)
     packed_scale_codec = os.environ.get("PACKED_SCALE_CODEC", DEFAULT_PACKED_SCALE_CODEC)
 
@@ -602,6 +604,7 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        use_xsa: bool = False,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -621,6 +624,7 @@ class CausalSelfAttention(nn.Module):
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
+        self.use_xsa = use_xsa
 
     def forward(self, x: Tensor, q_delta=None, v_delta=None) -> Tensor:
         bsz, seqlen, dim = x.shape
@@ -644,6 +648,12 @@ class CausalSelfAttention(nn.Module):
             is_causal=True,
             enable_gqa=(self.num_kv_heads != self.num_heads),
         )
+        if self.use_xsa:
+            v_xsa = v
+            if self.num_kv_heads != self.num_heads:
+                v_xsa = v_xsa.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
+            v_xsa = F.normalize(v_xsa, dim=-1)
+            y = y - (y * v_xsa).sum(dim=-1, keepdim=True) * v_xsa
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
@@ -672,11 +682,12 @@ class Block(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         mlp_hidden: int = 0,
+        use_xsa: bool = False,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, use_xsa=use_xsa)
         self.mlp = MLP(dim, mlp_mult, mlp_hidden=mlp_hidden)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -706,6 +717,7 @@ class GPT(nn.Module):
         mlp_hidden: int,
         num_shared_blocks: int,
         num_untied_tail_blocks: int,
+        xsa_tail_layers: int,
         tie_embeddings: bool,
         tied_embed_init_std: float,
         logit_softcap: float,
@@ -725,12 +737,15 @@ class GPT(nn.Module):
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         if num_shared_blocks < 0 or num_untied_tail_blocks < 0:
             raise ValueError("num_shared_blocks and num_untied_tail_blocks must be non-negative")
+        if xsa_tail_layers < 0 or xsa_tail_layers > num_layers:
+            raise ValueError(f"xsa_tail_layers must be in [0, {num_layers}], got {xsa_tail_layers}")
         if num_untied_tail_blocks > num_layers:
             raise ValueError(
                 f"num_untied_tail_blocks must be <= num_layers, got {num_untied_tail_blocks} > {num_layers}"
             )
         self.num_shared_blocks = num_shared_blocks
         self.num_untied_tail_blocks = num_untied_tail_blocks
+        self.xsa_tail_layers = xsa_tail_layers
         self.num_shared_prefix_layers = num_layers - num_untied_tail_blocks if num_shared_blocks > 0 else 0
         if num_shared_blocks > 0 and self.num_shared_prefix_layers <= 0:
             raise ValueError("num_shared_blocks requires at least one shared-prefix layer")
@@ -739,8 +754,13 @@ class GPT(nn.Module):
                 "num_shared_blocks must be <= num_layers - num_untied_tail_blocks "
                 f"(got {num_shared_blocks} > {self.num_shared_prefix_layers})"
             )
+        if num_shared_blocks > 0 and xsa_tail_layers > num_untied_tail_blocks:
+            raise ValueError(
+                "xsa_tail_layers must be <= num_untied_tail_blocks when using shared blocks "
+                f"(got {xsa_tail_layers} > {num_untied_tail_blocks})"
+            )
 
-        def make_block() -> Block:
+        def make_block(*, use_xsa: bool) -> Block:
             return Block(
                 model_dim,
                 num_heads,
@@ -749,18 +769,24 @@ class GPT(nn.Module):
                 rope_base,
                 qk_gain_init,
                 mlp_hidden=mlp_hidden,
+                use_xsa=use_xsa,
             )
 
         if num_shared_blocks > 0:
-            shared_blocks = [make_block() for _ in range(num_shared_blocks)]
-            tail_blocks = [make_block() for _ in range(num_untied_tail_blocks)]
+            shared_blocks = [make_block(use_xsa=False) for _ in range(num_shared_blocks)]
+            tail_blocks = [
+                make_block(use_xsa=(i >= num_untied_tail_blocks - xsa_tail_layers))
+                for i in range(num_untied_tail_blocks)
+            ]
             self.blocks = nn.ModuleList(shared_blocks + tail_blocks)
             self.logical_blocks = (
                 [shared_blocks[i % num_shared_blocks] for i in range(self.num_shared_prefix_layers)]
                 + tail_blocks
             )
         else:
-            self.blocks = nn.ModuleList([make_block() for _ in range(num_layers)])
+            self.blocks = nn.ModuleList(
+                [make_block(use_xsa=(i >= num_layers - xsa_tail_layers)) for i in range(num_layers)]
+            )
             self.logical_blocks = list(self.blocks)
         if len(self.logical_blocks) != num_layers:
             raise RuntimeError(f"logical block layout mismatch: expected {num_layers}, got {len(self.logical_blocks)}")
@@ -1134,6 +1160,7 @@ def main() -> None:
         mlp_hidden=args.mlp_hidden,
         num_shared_blocks=args.num_shared_blocks,
         num_untied_tail_blocks=args.num_untied_tail_blocks,
+        xsa_tail_layers=args.xsa_tail_layers,
         tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
@@ -1211,6 +1238,7 @@ def main() -> None:
         f"shared_blocks:{args.num_shared_blocks} untied_tail_blocks:{args.num_untied_tail_blocks} "
         f"registered_blocks:{len(base_model.blocks)} logical_blocks:{len(base_model.logical_blocks)}"
     )
+    log0(f"xsa_tail_layers:{args.xsa_tail_layers}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
@@ -1225,6 +1253,7 @@ def main() -> None:
         f"eval_mode:{args.eval_mode} eval_seq_len:{args.eval_seq_len} "
         f"eval_stride:{args.eval_stride} eval_batch_seqs:{args.eval_batch_seqs}"
     )
+    log0(f"run_ttt_eval:{args.run_ttt_eval}")
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1443,21 +1472,22 @@ def main() -> None:
     if args.log_eval_totals:
         log_eval_totals(log0, "final_int8_zlib_roundtrip", q_result)
 
-    # LoRA test-time training evaluation (the competition score)
-    torch._dynamo.reset()
-    torch.cuda.synchronize()
-    t_ttt = time.perf_counter()
-    ttt_result = eval_val_ttt_lora(
-        args, base_model, rank, world_size, device, val_tokens,
-        base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-    )
-    torch.cuda.synchronize()
-    log0(
-        f"final_int8_ttt_lora val_loss:{ttt_result.val_loss:.4f} val_bpb:{ttt_result.val_bpb:.4f} "
-        f"eval_time:{1000.0 * (time.perf_counter() - t_ttt):.0f}ms"
-    )
-    if args.log_eval_totals:
-        log_eval_totals(log0, "final_int8_ttt_lora", ttt_result)
+    if args.run_ttt_eval:
+        # LoRA test-time training evaluation (the competition score)
+        torch._dynamo.reset()
+        torch.cuda.synchronize()
+        t_ttt = time.perf_counter()
+        ttt_result = eval_val_ttt_lora(
+            args, base_model, rank, world_size, device, val_tokens,
+            base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+        )
+        torch.cuda.synchronize()
+        log0(
+            f"final_int8_ttt_lora val_loss:{ttt_result.val_loss:.4f} val_bpb:{ttt_result.val_bpb:.4f} "
+            f"eval_time:{1000.0 * (time.perf_counter() - t_ttt):.0f}ms"
+        )
+        if args.log_eval_totals:
+            log_eval_totals(log0, "final_int8_ttt_lora", ttt_result)
 
     if distributed:
         dist.destroy_process_group()

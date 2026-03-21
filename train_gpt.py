@@ -378,7 +378,7 @@ def eval_val_doc_sliding(
             f"got EVAL_SEQ_LEN={eval_seq_len}, EVAL_STRIDE={stride}"
         )
 
-    docs = find_docs(val_tokens, bos_id=BOS_ID, include_next_bos=False)
+    docs = find_docs(val_tokens, bos_id=BOS_ID, include_next_bos=True)
     rank_docs = docs[(len(docs) * rank) // world_size : (len(docs) * (rank + 1)) // world_size]
     rank_docs.sort(key=lambda doc: (doc[1] - 1 + stride - 1) // stride)
 
@@ -866,15 +866,15 @@ def eval_val_ttt_lora(
     rank: int,
     world_size: int,
     device: torch.device,
+    val_tokens: Tensor,
     base_bytes_lut: Tensor,
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
 ) -> EvalResult:
     """Evaluate with batched LoRA test-time training. Returns (val_loss, val_bpb)."""
-    # Load validation tokens and find document boundaries
-    files = sorted(glob.glob(args.val_files))
-    all_tokens = torch.cat([load_data_shard(Path(f)) for f in files])
-    docs = find_docs(all_tokens, bos_id=BOS_ID)
+    # Reuse the exact validation tensor used by the base evaluator so token/byte coverage stays locked.
+    all_tokens = val_tokens
+    docs = find_docs(all_tokens, bos_id=BOS_ID, include_next_bos=True)
 
     # Each rank takes a contiguous slice of documents
     rank_docs = docs[(len(docs) * rank) // world_size : (len(docs) * (rank + 1)) // world_size]
@@ -1393,7 +1393,7 @@ def main() -> None:
     torch.cuda.synchronize()
     t_ttt = time.perf_counter()
     ttt_result = eval_val_ttt_lora(
-        args, base_model, rank, world_size, device,
+        args, base_model, rank, world_size, device, val_tokens,
         base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
     )
     torch.cuda.synchronize()

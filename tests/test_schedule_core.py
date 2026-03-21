@@ -39,3 +39,10 @@ def test_find_docs_without_next_bos_excludes_boundary_token():
     tokens = torch.tensor([1, 11, 12, 1, 21, 22], dtype=torch.int64)
     docs = find_docs(tokens, bos_id=bos_id, include_next_bos=False)
     assert docs == [(0, 3), (3, 3)]
+
+
+def test_find_docs_with_next_bos_preserves_flat_prediction_count():
+    bos_id = 1
+    tokens = torch.tensor([1, 11, 12, 1, 21, 22], dtype=torch.int64)
+    docs = find_docs(tokens, bos_id=bos_id, include_next_bos=True)
+    assert sum(doc_len - 1 for _, doc_len in docs) == tokens.numel() - 1

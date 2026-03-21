@@ -41,7 +41,9 @@ default-groups = ["dev"]
 target-version = "py310"
 line-length = 100
 extend-exclude = [
+    "data",
     "records",
+    "train_gpt_mlx.py",
 ]
 
 [tool.ruff.lint]
@@ -57,7 +59,7 @@ line-ending = "lf"
 python-version = "3.10"
 
 [tool.ty.src]
-include = ["core", "tests"]
+include = ["core"]
 exclude = ["records", "data"]
 
 [tool.pytest.ini_options]

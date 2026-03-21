@@ -24,10 +24,17 @@ import sentencepiece as spm
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from torch import Tensor, nn
+from torch.backends.cuda import (
+    enable_cudnn_sdp,
+    enable_flash_sdp,
+    enable_math_sdp,
+    enable_mem_efficient_sdp,
+)
+from torch.nn.parallel import DistributedDataParallel as DDP
+
 from core.metric_core import compute_loss_byte_deltas, compute_token_bytes, compute_val_bpb
 from core.quant_core import CONTROL_TENSOR_NAME_PATTERNS, dequantize_state_dict_int8, quantize_state_dict_int8
-from torch import Tensor, nn
-from torch.nn.parallel import DistributedDataParallel as DDP
 
 # -----------------------------
 # HYPERPARAMETERS
@@ -865,7 +872,6 @@ def main() -> None:
     # Fast math knobs
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
 
     enable_cudnn_sdp(False)
     enable_flash_sdp(True)
@@ -892,7 +898,7 @@ def main() -> None:
     log0(f"Running Python {sys.version}", console=False)
     log0(f"Running PyTorch {torch.__version__}", console=False)
     log0(
-        subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False).stdout,
+        subprocess.run(["nvidia-smi"], capture_output=True, text=True, check=False).stdout,
         console=False,
     )
     log0("=" * 100, console=False)

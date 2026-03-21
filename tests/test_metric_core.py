@@ -45,7 +45,7 @@ def test_compute_token_bytes_matches_manual_accounting(case):
         case["is_boundary_token_lut"],
     )
     expected = []
-    for prev_id, tgt_id in zip(case["prev_ids"].tolist(), case["tgt_ids"].tolist()):
+    for prev_id, tgt_id in zip(case["prev_ids"].tolist(), case["tgt_ids"].tolist(), strict=True):
         bytes_for_token = int(case["base_bytes_lut"][tgt_id].item())
         if bool(case["has_leading_space_lut"][tgt_id].item()) and not bool(case["is_boundary_token_lut"][prev_id].item()):
             bytes_for_token += 1

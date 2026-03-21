@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from typing import TypedDict
 
 import torch
 from torch import Tensor
@@ -27,6 +28,21 @@ INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+
+
+class QuantMetaEntry(TypedDict):
+    scheme: str
+    axis: int
+
+
+class QuantizedStateDict(TypedDict, total=False):
+    __quant_format__: str
+    quantized: dict[str, Tensor]
+    scales: dict[str, Tensor]
+    dtypes: dict[str, str]
+    passthrough: dict[str, Tensor]
+    qmeta: dict[str, QuantMetaEntry]
+    passthrough_orig_dtypes: dict[str, str]
 
 
 def tensor_nbytes(t: Tensor) -> int:
@@ -61,7 +77,7 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
     return q, scale
 
 
-def quantize_state_dict_int8(state_dict: dict[str, Tensor]) -> tuple[dict[str, object], dict[str, int]]:
+def quantize_state_dict_int8(state_dict: dict[str, Tensor]) -> tuple[QuantizedStateDict, dict[str, int]]:
     quantized: dict[str, Tensor] = {}
     scales: dict[str, Tensor] = {}
     dtypes: dict[str, str] = {}
@@ -100,7 +116,7 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]) -> tuple[dict[str, o
         dtypes[name] = str(t.dtype).removeprefix("torch.")
         stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
 
-    obj: dict[str, object] = {
+    obj: QuantizedStateDict = {
         "__quant_format__": "int8_clean_per_row_v1",
         "quantized": quantized,
         "scales": scales,
@@ -114,7 +130,7 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]) -> tuple[dict[str, o
     return obj, stats
 
 
-def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
+def dequantize_state_dict_int8(obj: QuantizedStateDict) -> dict[str, Tensor]:
     out: dict[str, Tensor] = {}
     qmeta = obj.get("qmeta", {})
     passthrough_orig_dtypes = obj.get("passthrough_orig_dtypes", {})

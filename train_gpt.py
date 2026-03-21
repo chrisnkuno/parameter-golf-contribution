@@ -370,6 +370,7 @@ def eval_val_doc_sliding(
 
     docs = find_docs(val_tokens, bos_id=BOS_ID, include_next_bos=False)
     rank_docs = docs[(len(docs) * rank) // world_size : (len(docs) * (rank + 1)) // world_size]
+    rank_docs.sort(key=lambda doc: (doc[1] - 1 + stride - 1) // stride)
 
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     token_count = torch.zeros((), device=device, dtype=torch.float64)
@@ -384,25 +385,24 @@ def eval_val_doc_sliding(
             max_chunks = max(num_chunks, default=0)
 
             for ci in range(max_chunks):
-                windows = [
+                active_windows = [
                     compute_chunk_window(ci, pred_lens[doc_idx], num_chunks[doc_idx], stride, eval_seq_len)
-                    for doc_idx in range(len(batch))
                     if ci < num_chunks[doc_idx]
+                    else None
+                    for doc_idx in range(len(batch))
                 ]
-                max_win_len = max(window.win_len for window in windows)
+                max_win_len = max(window.win_len for window in active_windows if window is not None)
                 x = torch.zeros(len(batch), max_win_len, dtype=torch.int64, device=device)
                 y = torch.zeros(len(batch), max_win_len, dtype=torch.int64, device=device)
-                active_windows: list[ChunkWindow | None] = [None] * len(batch)
 
                 for doc_idx, (doc_start, _doc_len) in enumerate(batch):
-                    if ci >= num_chunks[doc_idx]:
+                    window = active_windows[doc_idx]
+                    if window is None:
                         continue
-                    window = compute_chunk_window(ci, pred_lens[doc_idx], num_chunks[doc_idx], stride, eval_seq_len)
                     tokens = val_tokens[doc_start + window.win_start : doc_start + window.win_start + window.win_len + 1]
                     local = tokens.to(dtype=torch.int64, device=device)
                     x[doc_idx, : window.win_len] = local[:-1]
                     y[doc_idx, : window.win_len] = local[1:]
-                    active_windows[doc_idx] = window
 
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     logits = model.forward_logits(x)

@@ -24,7 +24,7 @@ import sentencepiece as spm
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from core.metric_core import compute_loss_byte_deltas, compute_token_bytes, compute_val_bpb
+from core.metric_core import EvalResult, compute_loss_byte_deltas, compute_token_bytes, finalize_eval_result
 from core.quant_core import CONTROL_TENSOR_NAME_PATTERNS, dequantize_state_dict_int8, quantize_state_dict_int8
 from core.schedule_core import ChunkWindow, compute_chunk_window, find_docs
 from torch import Tensor, nn
@@ -62,6 +62,7 @@ class Hyperparameters:
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", "1024")))
     eval_stride = int(os.environ.get("EVAL_STRIDE", os.environ.get("TRAIN_SEQ_LEN", "1024")))
     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
+    log_eval_totals = bool(int(os.environ.get("LOG_EVAL_TOTALS", "1")))
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
@@ -247,7 +248,7 @@ def eval_val(
     base_bytes_lut: Tensor,
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
-) -> tuple[float, float]:
+) -> EvalResult:
     if args.eval_mode == "flat":
         return eval_val_flat(
             args,
@@ -287,7 +288,7 @@ def eval_val_flat(
     base_bytes_lut: Tensor,
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
-) -> tuple[float, float]:
+) -> EvalResult:
     # Validation computes two metrics:
     # - val_loss: token cross-entropy (natural log)
     # - val_bpb: tokenizer-agnostic compression metric used by the challenge
@@ -336,9 +337,8 @@ def eval_val_flat(
         dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
         dist.all_reduce(val_byte_count, op=dist.ReduceOp.SUM)
 
-    val_loss = val_loss_sum / val_token_count
     model.train()
-    return float(val_loss.item()), compute_val_bpb(val_loss_sum.item(), val_byte_count.item())
+    return finalize_eval_result(val_loss_sum, val_token_count, val_byte_count)
 
 
 def eval_val_doc_sliding(
@@ -351,7 +351,7 @@ def eval_val_doc_sliding(
     base_bytes_lut: Tensor,
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
-) -> tuple[float, float]:
+) -> EvalResult:
     """Score each document independently with sliding windows and no boundary leakage."""
     eval_seq_len = args.eval_seq_len
     stride = args.eval_stride
@@ -434,9 +434,8 @@ def eval_val_doc_sliding(
         dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
         dist.all_reduce(byte_count, op=dist.ReduceOp.SUM)
 
-    val_loss = loss_sum / token_count
     model.train()
-    return float(val_loss.item()), compute_val_bpb(loss_sum.item(), byte_count.item())
+    return finalize_eval_result(loss_sum, token_count, byte_count)
 
 # -----------------------------
 # POST-TRAINING QUANTIZATION
@@ -844,6 +843,13 @@ def _accumulate_bpb(
     byte_sum += byte_delta
     token_count += token_delta
 
+
+def log_eval_totals(log_fn, label: str, result: EvalResult) -> None:
+    log_fn(
+        f"{label}_raw loss_sum:{result.loss_sum:.8f} token_count:{int(result.token_count)} "
+        f"byte_count:{int(result.byte_count)} tokens_per_byte:{result.token_count / result.byte_count:.8f}"
+    )
+
 def eval_val_ttt_lora(
     args: Hyperparameters,
     base_model: GPT,
@@ -853,7 +859,7 @@ def eval_val_ttt_lora(
     base_bytes_lut: Tensor,
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
-) -> tuple[float, float]:
+) -> EvalResult:
     """Evaluate with batched LoRA test-time training. Returns (val_loss, val_bpb)."""
     # Load validation tokens and find document boundaries
     files = sorted(glob.glob(args.val_files))
@@ -867,7 +873,7 @@ def eval_val_ttt_lora(
     batch_size = args.ttt_batch_size
     lora_rank = args.ttt_lora_rank
 
-    rank_docs.sort(key=lambda d: (d[1] - 2) // chunk_size)
+    rank_docs.sort(key=lambda d: (d[1] - 1 + chunk_size - 1) // chunk_size)
 
     base_model.eval()
     for p in base_model.parameters():
@@ -897,21 +903,25 @@ def eval_val_ttt_lora(
         max_nc = max(num_chunks)
 
         for ci in range(max_nc):
-            chunk_stats = compute_chunk_window(ci, (ci + 1) * chunk_size, ci + 1, chunk_size, eval_seq_len)
-            context_size, chunk_offset = chunk_stats.win_len, chunk_stats.chunk_offset
-
-            active = [ci < nc for nc in num_chunks]
+            doc_windows = [
+                compute_chunk_window(ci, pred_lens[b], num_chunks[b], chunk_size, eval_seq_len)
+                if ci < num_chunks[b]
+                else None
+                for b in range(bsz)
+            ]
+            active = [window is not None for window in doc_windows]
             needs_train = any(ci < nc - 1 for nc in num_chunks)
+            context_size = max(window.win_len for window in doc_windows if window is not None)
 
             x = torch.zeros(bsz, context_size, dtype=torch.int64, device=device)
             y = torch.zeros(bsz, context_size, dtype=torch.int64, device=device)
             doc_info = []  # (chunk_offset, chunk_len) per doc
             for b in range(bsz):
-                if not active[b]:
+                window = doc_windows[b]
+                if window is None:
                     doc_info.append((0, 0))
                     continue
-                ds, dl = batch[b]
-                window = compute_chunk_window(ci, pred_lens[b], num_chunks[b], chunk_size, eval_seq_len)
+                ds, _dl = batch[b]
                 ws, wl, co, cl = (
                     window.win_start,
                     window.win_len,
@@ -944,8 +954,16 @@ def eval_val_ttt_lora(
 
             # Train: one Adam step on the LoRA params using this chunk's loss
             if needs_train:
-                mask = torch.tensor([float(ci < num_chunks[b] - 1) for b in range(bsz)], device=device)
-                per_doc = ptl[:, chunk_offset:chunk_offset + chunk_size].mean(dim=-1)
+                per_doc = torch.zeros(bsz, device=device, dtype=ptl.dtype)
+                mask = torch.zeros(bsz, device=device, dtype=ptl.dtype)
+                for b, window in enumerate(doc_windows):
+                    if window is None or ci >= num_chunks[b] - 1:
+                        continue
+                    co, cl = doc_info[b]
+                    if cl != chunk_size:
+                        raise AssertionError("Only fully scored non-final chunks may be used for TTT updates")
+                    per_doc[b] = ptl[b, co : co + cl].mean()
+                    mask[b] = 1.0
                 cur_opt.zero_grad()
                 (per_doc * mask).sum().backward()
                 cur_opt.step()
@@ -955,9 +973,7 @@ def eval_val_ttt_lora(
         dist.all_reduce(byte_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
 
-    val_loss = float(loss_sum.item() / token_count.item())
-    val_bpb = compute_val_bpb(loss_sum.item(), byte_sum.item())
-    return val_loss, val_bpb
+    return finalize_eval_result(loss_sum, token_count, byte_sum)
 
 # -----------------------------
 # TRAINING
@@ -1217,7 +1233,7 @@ def main() -> None:
         if should_validate:
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
-            val_loss, val_bpb = eval_val(
+            val_result = eval_val(
                 args,
                 model,
                 rank,
@@ -1230,9 +1246,11 @@ def main() -> None:
                 is_boundary_token_lut,
             )
             log0(
-                f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
+                f"step:{step}/{args.iterations} val_loss:{val_result.val_loss:.4f} val_bpb:{val_result.val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
+            if args.log_eval_totals:
+                log_eval_totals(log0, f"step:{step}/{args.iterations} val", val_result)
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 
@@ -1339,7 +1357,7 @@ def main() -> None:
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
-    q_val_loss, q_val_bpb = eval_val(
+    q_result = eval_val(
         args,
         model,
         rank,
@@ -1353,24 +1371,28 @@ def main() -> None:
     )
     torch.cuda.synchronize()
     log0(
-        f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+        f"final_int8_zlib_roundtrip val_loss:{q_result.val_loss:.4f} val_bpb:{q_result.val_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
-    log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_result.val_loss:.8f} val_bpb:{q_result.val_bpb:.8f}")
+    if args.log_eval_totals:
+        log_eval_totals(log0, "final_int8_zlib_roundtrip", q_result)
 
     # LoRA test-time training evaluation (the competition score)
     torch._dynamo.reset()
     torch.cuda.synchronize()
     t_ttt = time.perf_counter()
-    ttt_val_loss, ttt_val_bpb = eval_val_ttt_lora(
+    ttt_result = eval_val_ttt_lora(
         args, base_model, rank, world_size, device,
         base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
     )
     torch.cuda.synchronize()
     log0(
-        f"final_int8_ttt_lora val_loss:{ttt_val_loss:.4f} val_bpb:{ttt_val_bpb:.4f} "
+        f"final_int8_ttt_lora val_loss:{ttt_result.val_loss:.4f} val_bpb:{ttt_result.val_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_ttt):.0f}ms"
     )
+    if args.log_eval_totals:
+        log_eval_totals(log0, "final_int8_ttt_lora", ttt_result)
 
     if distributed:
         dist.destroy_process_group()

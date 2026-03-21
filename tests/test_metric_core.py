@@ -4,7 +4,7 @@ import math
 
 import pytest
 import torch
-from core.metric_core import compute_loss_byte_deltas, compute_token_bytes, compute_val_bpb
+from core.metric_core import compute_loss_byte_deltas, compute_token_bytes, compute_val_bpb, finalize_eval_result
 from hypothesis import given
 from hypothesis import strategies as st
 
@@ -96,3 +96,19 @@ def test_compute_val_bpb_matches_formula():
 def test_compute_val_bpb_rejects_nonpositive_byte_count():
     with pytest.raises(ValueError):
         compute_val_bpb(1.0, 0)
+
+
+def test_finalize_eval_result_matches_formula():
+    result = finalize_eval_result(loss_sum=13.5, token_count=6, byte_count=9)
+    assert result.val_loss == pytest.approx(13.5 / 6)
+    assert result.val_bpb == pytest.approx((13.5 / math.log(2.0)) / 9)
+    assert result.loss_sum == pytest.approx(13.5)
+    assert result.token_count == pytest.approx(6.0)
+    assert result.byte_count == pytest.approx(9.0)
+
+
+def test_finalize_eval_result_rejects_nonpositive_counts():
+    with pytest.raises(ValueError):
+        finalize_eval_result(loss_sum=1.0, token_count=0, byte_count=2)
+    with pytest.raises(ValueError):
+        finalize_eval_result(loss_sum=1.0, token_count=2, byte_count=0)

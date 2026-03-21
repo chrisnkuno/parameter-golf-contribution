@@ -94,6 +94,9 @@ class Hyperparameters:
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
+    mlp_hidden = int(os.environ.get("MLP_HIDDEN", 0))
+    num_shared_blocks = int(os.environ.get("NUM_SHARED_BLOCKS", 0))
+    num_untied_tail_blocks = int(os.environ.get("NUM_UNTIED_TAIL_BLOCKS", 0))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -647,9 +650,9 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
     # relu^2 MLP from the original modded-nanogpt setup
-    def __init__(self, dim: int, mlp_mult: int):
+    def __init__(self, dim: int, mlp_mult: int, mlp_hidden: int = 0):
         super().__init__()
-        hidden = mlp_mult * dim
+        hidden = mlp_hidden if mlp_hidden > 0 else mlp_mult * dim
         self.fc = CastedLinear(dim, hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
@@ -668,12 +671,13 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        mlp_hidden: int = 0,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
+        self.mlp = MLP(dim, mlp_mult, mlp_hidden=mlp_hidden)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -699,6 +703,9 @@ class GPT(nn.Module):
         num_heads: int,
         num_kv_heads: int,
         mlp_mult: int,
+        mlp_hidden: int,
+        num_shared_blocks: int,
+        num_untied_tail_blocks: int,
         tie_embeddings: bool,
         tied_embed_init_std: float,
         logit_softcap: float,
@@ -716,19 +723,47 @@ class GPT(nn.Module):
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
-        self.blocks = nn.ModuleList(
-            [
-                Block(
-                    model_dim,
-                    num_heads,
-                    num_kv_heads,
-                    mlp_mult,
-                    rope_base,
-                    qk_gain_init,
-                )
-                for i in range(num_layers)
-            ]
-        )
+        if num_shared_blocks < 0 or num_untied_tail_blocks < 0:
+            raise ValueError("num_shared_blocks and num_untied_tail_blocks must be non-negative")
+        if num_untied_tail_blocks > num_layers:
+            raise ValueError(
+                f"num_untied_tail_blocks must be <= num_layers, got {num_untied_tail_blocks} > {num_layers}"
+            )
+        self.num_shared_blocks = num_shared_blocks
+        self.num_untied_tail_blocks = num_untied_tail_blocks
+        self.num_shared_prefix_layers = num_layers - num_untied_tail_blocks if num_shared_blocks > 0 else 0
+        if num_shared_blocks > 0 and self.num_shared_prefix_layers <= 0:
+            raise ValueError("num_shared_blocks requires at least one shared-prefix layer")
+        if num_shared_blocks > 0 and num_shared_blocks > self.num_shared_prefix_layers:
+            raise ValueError(
+                "num_shared_blocks must be <= num_layers - num_untied_tail_blocks "
+                f"(got {num_shared_blocks} > {self.num_shared_prefix_layers})"
+            )
+
+        def make_block() -> Block:
+            return Block(
+                model_dim,
+                num_heads,
+                num_kv_heads,
+                mlp_mult,
+                rope_base,
+                qk_gain_init,
+                mlp_hidden=mlp_hidden,
+            )
+
+        if num_shared_blocks > 0:
+            shared_blocks = [make_block() for _ in range(num_shared_blocks)]
+            tail_blocks = [make_block() for _ in range(num_untied_tail_blocks)]
+            self.blocks = nn.ModuleList(shared_blocks + tail_blocks)
+            self.logical_blocks = (
+                [shared_blocks[i % num_shared_blocks] for i in range(self.num_shared_prefix_layers)]
+                + tail_blocks
+            )
+        else:
+            self.blocks = nn.ModuleList([make_block() for _ in range(num_layers)])
+            self.logical_blocks = list(self.blocks)
+        if len(self.logical_blocks) != num_layers:
+            raise RuntimeError(f"logical block layout mismatch: expected {num_layers}, got {len(self.logical_blocks)}")
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -752,7 +787,7 @@ class GPT(nn.Module):
         for i in range(self.num_encoder_layers):
             qd = lora.q_loras[i] if lora else None
             vd = lora.v_loras[i] if lora else None
-            x = self.blocks[i](x, x0, qd, vd)
+            x = self.logical_blocks[i](x, x0, qd, vd)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
@@ -760,7 +795,7 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             qd = lora.q_loras[bi] if lora else None
             vd = lora.v_loras[bi] if lora else None
-            x = self.blocks[bi](x, x0, qd, vd)
+            x = self.logical_blocks[bi](x, x0, qd, vd)
         x = self.final_norm(x)
         if self.tie_embeddings:
             logits = F.linear(x, self.tok_emb.weight)
@@ -815,7 +850,7 @@ class BatchedTTTLoRA(nn.Module):
         self.lm_head_lora = BatchedLinearLoRA(bsz, dim, vocab, rank)
         self.q_loras = nn.ModuleList()
         self.v_loras = nn.ModuleList()
-        for block in model.blocks:
+        for block in model.logical_blocks:
             self.q_loras.append(BatchedLinearLoRA(bsz, dim, block.attn.c_q.weight.shape[0], rank))
             self.v_loras.append(BatchedLinearLoRA(bsz, dim, block.attn.c_v.weight.shape[0], rank))
 
@@ -1096,6 +1131,9 @@ def main() -> None:
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
         mlp_mult=args.mlp_mult,
+        mlp_hidden=args.mlp_hidden,
+        num_shared_blocks=args.num_shared_blocks,
+        num_untied_tail_blocks=args.num_untied_tail_blocks,
         tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
@@ -1165,6 +1203,14 @@ def main() -> None:
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(
+        f"mlp_hidden:{args.mlp_hidden if args.mlp_hidden > 0 else args.mlp_mult * args.model_dim} "
+        f"(mlp_mult:{args.mlp_mult})"
+    )
+    log0(
+        f"shared_blocks:{args.num_shared_blocks} untied_tail_blocks:{args.num_untied_tail_blocks} "
+        f"registered_blocks:{len(base_model.blocks)} logical_blocks:{len(base_model.logical_blocks)}"
+    )
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "

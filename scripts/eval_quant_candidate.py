@@ -23,6 +23,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--state-dict-path", type=Path, default=Path("final_model.pt"))
     parser.add_argument("--keep-large-patterns", type=str, default=None)
     parser.add_argument("--no-default-large-keeps", action="store_true")
+    parser.add_argument("--preconditioner", type=str, default=None)
+    parser.add_argument("--precondition-patterns", type=str, default=None)
     parser.add_argument("--quant-artifact-format", type=str, default="packed_zstd")
     parser.add_argument("--packed-scale-codec", type=str, default="raw")
     parser.add_argument("--train-seq-len", type=int, default=256)
@@ -33,6 +35,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-heads", type=int, default=8)
     parser.add_argument("--num-kv-heads", type=int, default=4)
     parser.add_argument("--mlp-mult", type=int, default=2)
+    parser.add_argument("--mlp-hidden", type=int, default=0)
+    parser.add_argument("--num-shared-blocks", type=int, default=0)
+    parser.add_argument("--num-untied-tail-blocks", type=int, default=0)
     parser.add_argument("--tie-embeddings", type=int, default=1)
     parser.add_argument("--tokenizer-path", type=str, default="./data/tokenizers/fineweb_1024_bpe.model")
     parser.add_argument("--data-path", type=str, default="./data/datasets/fineweb10B_sp1024")
@@ -53,6 +58,9 @@ def build_args(cli: argparse.Namespace) -> tg.Hyperparameters:
     args.num_heads = cli.num_heads
     args.num_kv_heads = cli.num_kv_heads
     args.mlp_mult = cli.mlp_mult
+    args.mlp_hidden = cli.mlp_hidden
+    args.num_shared_blocks = cli.num_shared_blocks
+    args.num_untied_tail_blocks = cli.num_untied_tail_blocks
     args.tie_embeddings = bool(cli.tie_embeddings)
     args.eval_mode = "flat"
     args.eval_seq_len = cli.train_seq_len
@@ -69,6 +77,10 @@ def main() -> None:
         os.environ["INT8_KEEP_LARGE_FLOAT_NAME_PATTERNS"] = ""
     elif cli.keep_large_patterns is not None:
         os.environ["INT8_KEEP_LARGE_FLOAT_NAME_PATTERNS"] = cli.keep_large_patterns
+    if cli.preconditioner is not None:
+        os.environ["INT8_PRECONDITIONER"] = cli.preconditioner
+    if cli.precondition_patterns is not None:
+        os.environ["INT8_PRECONDITIONER_NAME_PATTERNS"] = cli.precondition_patterns
 
     import core.quant_core as quant_core
 
@@ -99,6 +111,9 @@ def main() -> None:
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
         mlp_mult=args.mlp_mult,
+        mlp_hidden=args.mlp_hidden,
+        num_shared_blocks=args.num_shared_blocks,
+        num_untied_tail_blocks=args.num_untied_tail_blocks,
         tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
@@ -137,13 +152,20 @@ def main() -> None:
         json.dumps(
             {
                 "keep_large_patterns": cli.keep_large_patterns,
+                "preconditioner": cli.preconditioner or quant_core.INT8_PRECONDITIONER,
+                "precondition_patterns": cli.precondition_patterns or ",".join(quant_core.INT8_PRECONDITIONER_NAME_PATTERNS),
                 "quant_artifact_format": cli.quant_artifact_format,
                 "packed_scale_codec": cli.packed_scale_codec,
+                "mlp_hidden": cli.mlp_hidden,
+                "num_shared_blocks": cli.num_shared_blocks,
+                "num_untied_tail_blocks": cli.num_untied_tail_blocks,
                 "artifact_raw_serialized_bytes": raw_len,
                 "artifact_compressed_bytes": len(artifact_blob),
                 "int8_payload_bytes": quant_stats["int8_payload_bytes"],
                 "large_float_passthrough_bytes": quant_stats["large_float_passthrough_bytes"],
                 "num_large_float_passthrough_tensors": quant_stats["num_large_float_passthrough_tensors"],
+                "num_preconditioned_tensors": quant_stats["num_preconditioned_tensors"],
+                "preconditioned_tensor_bytes": quant_stats["preconditioned_tensor_bytes"],
                 "val_loss": result.val_loss,
                 "val_bpb": result.val_bpb,
                 "eval_time_ms": 1000.0 * (time.perf_counter() - t0),

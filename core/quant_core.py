@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import math
 import os
 from typing import TypedDict
 
@@ -36,11 +38,24 @@ INT8_KEEP_LARGE_FLOAT_NAME_PATTERNS = tuple(
     ).split(",")
     if pattern
 )
+SUPPORTED_INT8_PRECONDITIONERS = ("none", "hadamard", "hadamard_sign")
+INT8_PRECONDITIONER = os.environ.get("INT8_PRECONDITIONER", "none").strip().lower() or "none"
+INT8_PRECONDITIONER_NAME_PATTERNS = tuple(
+    pattern for pattern in os.environ.get("INT8_PRECONDITIONER_NAME_PATTERNS", "").split(",") if pattern
+)
+
+if INT8_PRECONDITIONER not in SUPPORTED_INT8_PRECONDITIONERS:
+    raise ValueError(
+        f"Unsupported INT8_PRECONDITIONER={INT8_PRECONDITIONER!r}; "
+        f"expected one of {SUPPORTED_INT8_PRECONDITIONERS}"
+    )
 
 
-class QuantMetaEntry(TypedDict):
+class QuantMetaEntry(TypedDict, total=False):
     scheme: str
     axis: int
+    preconditioner: str
+    precondition_dim: int
 
 
 class QuantizedStateDict(TypedDict, total=False):
@@ -57,6 +72,10 @@ def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
 
 
+def is_power_of_two(n: int) -> bool:
+    return n > 0 and (n & (n - 1)) == 0
+
+
 def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, str]) -> Tensor:
     if any(pattern in name for pattern in INT8_KEEP_FLOAT_FP32_NAME_PATTERNS):
         return t.float().contiguous()
@@ -68,6 +87,76 @@ def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, s
 
 def should_keep_large_float_tensor(name: str) -> bool:
     return any(pattern in name for pattern in INT8_KEEP_LARGE_FLOAT_NAME_PATTERNS)
+
+
+def should_precondition_tensor(name: str, t: Tensor) -> bool:
+    return (
+        INT8_PRECONDITIONER != "none"
+        and t.ndim == 2
+        and bool(INT8_PRECONDITIONER_NAME_PATTERNS)
+        and any(pattern in name for pattern in INT8_PRECONDITIONER_NAME_PATTERNS)
+        and is_power_of_two(int(t.shape[-1]))
+    )
+
+
+def hadamard_transform_last_dim(t: Tensor) -> Tensor:
+    width = int(t.shape[-1])
+    if not is_power_of_two(width):
+        raise ValueError(f"Hadamard preconditioner requires a power-of-two last dim, got {tuple(t.shape)}")
+    x = t.to(dtype=torch.float32).reshape(-1, width).clone()
+    h = 1
+    while h < width:
+        x = x.view(-1, width // (2 * h), 2, h)
+        a = x[:, :, 0, :].clone()
+        b = x[:, :, 1, :].clone()
+        x[:, :, 0, :] = a + b
+        x[:, :, 1, :] = a - b
+        x = x.view(-1, width)
+        h *= 2
+    return (x / math.sqrt(width)).reshape_as(t).contiguous()
+
+
+def deterministic_sign_vector(name: str, width: int) -> Tensor:
+    values: list[float] = []
+    counter = 0
+    while len(values) < width:
+        digest = hashlib.sha256(f"{name}:{width}:{counter}".encode("utf-8")).digest()
+        for byte in digest:
+            for bit_idx in range(8):
+                values.append(1.0 if ((byte >> bit_idx) & 1) else -1.0)
+                if len(values) == width:
+                    break
+            if len(values) == width:
+                break
+        counter += 1
+    return torch.tensor(values, dtype=torch.float32)
+
+
+def apply_structured_preconditioner(name: str, t: Tensor, preconditioner: str) -> Tensor:
+    if preconditioner == "none":
+        return t.detach().clone().contiguous()
+    if t.ndim != 2:
+        raise ValueError(f"Structured preconditioner requires a 2D tensor, got {tuple(t.shape)}")
+    base = t.to(dtype=torch.float32)
+    if preconditioner == "hadamard":
+        return hadamard_transform_last_dim(base)
+    if preconditioner == "hadamard_sign":
+        sign = deterministic_sign_vector(name, int(base.shape[-1])).to(device=base.device)
+        return hadamard_transform_last_dim(base * sign.view(1, -1))
+    raise ValueError(f"Unsupported structured preconditioner: {preconditioner}")
+
+
+def invert_structured_preconditioner(name: str, t: Tensor, preconditioner: str) -> Tensor:
+    if preconditioner == "none":
+        return t.detach().clone().contiguous()
+    original_dtype = t.dtype
+    base = t.to(dtype=torch.float32)
+    if preconditioner == "hadamard":
+        return hadamard_transform_last_dim(base).to(dtype=original_dtype).contiguous()
+    if preconditioner == "hadamard_sign":
+        sign = deterministic_sign_vector(name, int(base.shape[-1])).to(device=base.device)
+        return (hadamard_transform_last_dim(base) * sign.view(1, -1)).to(dtype=original_dtype).contiguous()
+    raise ValueError(f"Unsupported structured preconditioner: {preconditioner}")
 
 
 def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
@@ -105,6 +194,8 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]) -> tuple[QuantizedSt
             "num_nonfloat_tensors",
             "num_large_float_passthrough_tensors",
             "large_float_passthrough_bytes",
+            "num_preconditioned_tensors",
+            "preconditioned_tensor_bytes",
             "baseline_tensor_bytes",
             "int8_payload_bytes",
         ),
@@ -138,9 +229,20 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]) -> tuple[QuantizedSt
             continue
 
         stats["num_float_tensors"] += 1
-        q, s = quantize_float_tensor(t)
+        to_quantize = t.float()
+        meta: QuantMetaEntry = {}
+        if should_precondition_tensor(name, t):
+            to_quantize = apply_structured_preconditioner(name, to_quantize, INT8_PRECONDITIONER)
+            meta["preconditioner"] = INT8_PRECONDITIONER
+            meta["precondition_dim"] = int(t.shape[-1])
+            stats["num_preconditioned_tensors"] += 1
+            stats["preconditioned_tensor_bytes"] += tensor_nbytes(t)
+        q, s = quantize_float_tensor(to_quantize)
         if s.ndim > 0:
-            qmeta[name] = {"scheme": "per_row", "axis": 0}
+            meta["scheme"] = "per_row"
+            meta["axis"] = 0
+        if meta:
+            qmeta[name] = meta
         quantized[name] = q
         scales[name] = s
         dtypes[name] = str(t.dtype).removeprefix("torch.")
@@ -166,13 +268,23 @@ def dequantize_state_dict_int8(obj: QuantizedStateDict) -> dict[str, Tensor]:
     passthrough_orig_dtypes = obj.get("passthrough_orig_dtypes", {})
     for name, q in obj["quantized"].items():
         dtype = getattr(torch, obj["dtypes"][name])
+        meta = qmeta.get(name, {})
         s = obj["scales"][name]
-        if qmeta.get(name, {}).get("scheme") == "per_row" or s.ndim > 0:
+        if meta.get("scheme") == "per_row" or s.ndim > 0:
             s = s.to(dtype=torch.float32)
-            out[name] = (q.float() * s.view(q.shape[0], *([1] * (q.ndim - 1)))).to(dtype=dtype).contiguous()
+            dequantized = (q.float() * s.view(q.shape[0], *([1] * (q.ndim - 1)))).to(dtype=dtype).contiguous()
         else:
             scale = float(s.item())
-            out[name] = (q.float() * scale).to(dtype=dtype).contiguous()
+            dequantized = (q.float() * scale).to(dtype=dtype).contiguous()
+        preconditioner = meta.get("preconditioner")
+        if isinstance(preconditioner, str) and preconditioner != "none":
+            expected_dim = int(meta.get("precondition_dim", dequantized.shape[-1]))
+            if int(dequantized.shape[-1]) != expected_dim:
+                raise ValueError(
+                    f"Preconditioned tensor {name} expected last dim {expected_dim}, got {tuple(dequantized.shape)}"
+                )
+            dequantized = invert_structured_preconditioner(name, dequantized, preconditioner)
+        out[name] = dequantized
     for name, t in obj["passthrough"].items():
         out_t = t.detach().to("cpu").contiguous()
         orig_dtype = passthrough_orig_dtypes.get(name)

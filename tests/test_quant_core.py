@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import importlib
-import os
 
 import torch
 from hypothesis import given
 from hypothesis import strategies as st
 
 from core.quant_core import (
+    apply_structured_preconditioner,
     dequantize_state_dict_int8,
+    invert_structured_preconditioner,
     quantize_float_tensor,
     quantize_state_dict_int8,
 )
@@ -74,6 +75,16 @@ def test_quantize_state_dict_roundtrip_preserves_keys_shapes_and_dtypes():
     assert max_error <= max_scale + 1e-6
 
 
+def test_hadamard_sign_preconditioner_is_reversible():
+    tensor = torch.linspace(-3.0, 3.0, 32, dtype=torch.float32).reshape(4, 8)
+
+    transformed = apply_structured_preconditioner("blocks.0.mlp.fc.weight", tensor, "hadamard_sign")
+    restored = invert_structured_preconditioner("blocks.0.mlp.fc.weight", transformed, "hadamard_sign")
+
+    assert transformed.shape == tensor.shape
+    assert torch.allclose(restored, tensor, atol=1e-5, rtol=1e-5)
+
+
 def test_tok_emb_weight_is_default_large_float_passthrough(monkeypatch):
     monkeypatch.delenv("INT8_KEEP_LARGE_FLOAT_NAME_PATTERNS", raising=False)
     import core.quant_core as quant_core
@@ -111,3 +122,47 @@ def test_large_float_passthrough_override_keeps_selected_large_tensor(monkeypatc
     assert stats["num_large_float_passthrough_tensors"] == 1
     assert stats["large_float_passthrough_bytes"] == quant_core.tensor_nbytes(quant_obj["passthrough"]["large.weight"])
     assert quant_obj["passthrough"]["large.weight"].dtype == torch.float16
+
+
+def test_preconditioner_metadata_and_roundtrip(monkeypatch):
+    monkeypatch.setenv("INT8_PRECONDITIONER", "hadamard_sign")
+    monkeypatch.setenv("INT8_PRECONDITIONER_NAME_PATTERNS", "large.weight")
+    monkeypatch.setenv("INT8_KEEP_LARGE_FLOAT_NAME_PATTERNS", "")
+    import core.quant_core as quant_core
+
+    quant_core = importlib.reload(quant_core)
+    state_dict = {
+        "large.weight": torch.linspace(-0.5, 0.5, 300 * 256, dtype=torch.float32).reshape(300, 256),
+        "other.weight": torch.linspace(-0.5, 0.5, 300 * 256, dtype=torch.float32).reshape(300, 256),
+    }
+
+    quant_obj, stats = quant_core.quantize_state_dict_int8(state_dict)
+    restored = quant_core.dequantize_state_dict_int8(quant_obj)
+
+    meta = quant_obj["qmeta"]["large.weight"]
+    assert meta["preconditioner"] == "hadamard_sign"
+    assert meta["precondition_dim"] == 256
+    assert "preconditioner" not in quant_obj["qmeta"]["other.weight"]
+    assert stats["num_preconditioned_tensors"] == 1
+    assert stats["preconditioned_tensor_bytes"] == quant_core.tensor_nbytes(state_dict["large.weight"])
+    assert restored["large.weight"].shape == state_dict["large.weight"].shape
+    assert restored["large.weight"].dtype == state_dict["large.weight"].dtype
+    assert restored["other.weight"].shape == state_dict["other.weight"].shape
+
+
+def test_preconditioner_skips_non_power_of_two_width(monkeypatch):
+    monkeypatch.setenv("INT8_PRECONDITIONER", "hadamard")
+    monkeypatch.setenv("INT8_PRECONDITIONER_NAME_PATTERNS", "large.weight")
+    monkeypatch.setenv("INT8_KEEP_LARGE_FLOAT_NAME_PATTERNS", "")
+    import core.quant_core as quant_core
+
+    quant_core = importlib.reload(quant_core)
+    state_dict = {
+        "large.weight": torch.linspace(-0.5, 0.5, 300 * 250, dtype=torch.float32).reshape(300, 250),
+    }
+
+    quant_obj, stats = quant_core.quantize_state_dict_int8(state_dict)
+
+    assert quant_obj["qmeta"]["large.weight"]["scheme"] == "per_row"
+    assert "preconditioner" not in quant_obj["qmeta"]["large.weight"]
+    assert stats["num_preconditioned_tensors"] == 0

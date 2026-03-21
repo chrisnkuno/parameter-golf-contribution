@@ -3,8 +3,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from pathlib import Path
 import sys
+from pathlib import Path
 
 import torch
 
@@ -40,6 +40,18 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable the baked-in default large-float keep rules.",
     )
+    parser.add_argument(
+        "--preconditioner",
+        type=str,
+        default=None,
+        help="Structured preconditioner to apply before quantizing matched tensors.",
+    )
+    parser.add_argument(
+        "--precondition-patterns",
+        type=str,
+        default=None,
+        help="Comma-separated substrings for tensors to precondition before quantization.",
+    )
     return parser.parse_args()
 
 
@@ -49,6 +61,10 @@ def main() -> None:
         os.environ["INT8_KEEP_LARGE_FLOAT_NAME_PATTERNS"] = ""
     elif args.keep_large_patterns is not None:
         os.environ["INT8_KEEP_LARGE_FLOAT_NAME_PATTERNS"] = args.keep_large_patterns
+    if args.preconditioner is not None:
+        os.environ["INT8_PRECONDITIONER"] = args.preconditioner
+    if args.precondition_patterns is not None:
+        os.environ["INT8_PRECONDITIONER_NAME_PATTERNS"] = args.precondition_patterns
 
     import importlib
     import core.quant_core as quant_core
@@ -103,16 +119,21 @@ def main() -> None:
         "checkpoint": str(args.state_dict_path),
         "keep_large_patterns": args.keep_large_patterns or "",
         "no_default_large_keeps": args.no_default_large_keeps,
+        "preconditioner": args.preconditioner or quant_core.INT8_PRECONDITIONER,
+        "precondition_patterns": args.precondition_patterns or ",".join(quant_core.INT8_PRECONDITIONER_NAME_PATTERNS),
         "baseline_tensor_bytes": quant_stats["baseline_tensor_bytes"],
         "int8_payload_bytes": quant_stats["int8_payload_bytes"],
         "large_float_passthrough_bytes": quant_stats["large_float_passthrough_bytes"],
         "num_large_float_passthrough_tensors": quant_stats["num_large_float_passthrough_tensors"],
+        "num_preconditioned_tensors": quant_stats["num_preconditioned_tensors"],
+        "preconditioned_tensor_bytes": quant_stats["preconditioned_tensor_bytes"],
         "top_quantized_tensors": [
             {
                 "name": name,
                 "nbytes": quant_core.tensor_nbytes(tensor),
                 "shape": list(tensor.shape),
                 "scale_nbytes": quant_core.tensor_nbytes(quant_obj["scales"][name]),
+                "preconditioner": quant_obj.get("qmeta", {}).get(name, {}).get("preconditioner", "none"),
             }
             for name, tensor in sorted(
                 quant_obj["quantized"].items(),

@@ -8,7 +8,7 @@ from typing import Literal, TypedDict
 import torch
 from torch import Tensor
 
-from core.quant_core import QuantMetaEntry, QuantizedStateDict
+from core.quant_core import QuantizedStateDict, QuantMetaEntry
 
 PACKED_ARTIFACT_MAGIC = b"PGQ1"
 PACKED_ARTIFACT_VERSION = 1

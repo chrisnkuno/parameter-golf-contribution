@@ -24,6 +24,9 @@ import sentencepiece as spm
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from core.metric_core import compute_loss_byte_deltas, compute_token_bytes, compute_val_bpb
+from core.quant_core import CONTROL_TENSOR_NAME_PATTERNS, dequantize_state_dict_int8, quantize_state_dict_int8
+from core.schedule_core import compute_chunk_window, find_docs
 from torch import Tensor, nn
 from torch.backends.cuda import (
     enable_cudnn_sdp,
@@ -32,9 +35,6 @@ from torch.backends.cuda import (
     enable_mem_efficient_sdp,
 )
 from torch.nn.parallel import DistributedDataParallel as DDP
-
-from core.metric_core import compute_loss_byte_deltas, compute_token_bytes, compute_val_bpb
-from core.quant_core import CONTROL_TENSOR_NAME_PATTERNS, dequantize_state_dict_int8, quantize_state_dict_int8
 
 # -----------------------------
 # HYPERPARAMETERS
@@ -677,33 +677,6 @@ def _reset_ttt_optimizer(opt):
 def _build_ttt_optimizer(lora, args: Hyperparameters):
     return torch.optim.Adam(lora.parameters(), lr=args.ttt_lora_lr, betas=(args.beta1, args.beta2), eps=1e-10)
 
-def _find_docs(all_tokens: Tensor, include_next_bos: bool = True) -> list[tuple[int, int]]:
-    """Return (start_offset, length) for each document, identified by BOS boundaries.
-
-    If include_next_bos is True, include next document's BOS (to match continuous-stream
-    eval token count exactly).
-    """
-    bos_positions = (all_tokens == BOS_ID).nonzero(as_tuple=True)[0].numpy()
-    docs = []
-    for i in range(len(bos_positions)):
-        start = int(bos_positions[i])
-        end = int(bos_positions[i + 1]) if i + 1 < len(bos_positions) else all_tokens.numel()
-        if include_next_bos and i + 1 < len(bos_positions):
-            end += 1
-        assert end - start >= 2
-        docs.append((start, end - start))
-    return docs
-
-def _compute_chunk_window(ci: int, pred_len: int, num_chunks: int, chunk_size: int, eval_seq_len: int):
-    """Return (win_start, win_len, chunk_offset, chunk_len) for chunk `ci` of a doc."""
-    chunk_start = ci * chunk_size
-    chunk_end = pred_len if ci == num_chunks - 1 else (ci + 1) * chunk_size
-    win_start = max(0, chunk_end - eval_seq_len)
-    win_len = chunk_end - win_start
-    chunk_offset = chunk_start - win_start
-    chunk_len = chunk_end - chunk_start
-    return win_start, win_len, chunk_offset, chunk_len
-
 def _accumulate_bpb(
     ptl: Tensor, x: Tensor, y: Tensor,
     batch_i: int, chunk_offset: int, chunk_len: int,
@@ -740,7 +713,7 @@ def eval_val_ttt_lora(
     # Load validation tokens and find document boundaries
     files = sorted(glob.glob(args.val_files))
     all_tokens = torch.cat([load_data_shard(Path(f)) for f in files])
-    docs = _find_docs(all_tokens)
+    docs = find_docs(all_tokens, bos_id=BOS_ID)
 
     # Each rank takes a contiguous slice of documents
     rank_docs = docs[(len(docs) * rank) // world_size : (len(docs) * (rank + 1)) // world_size]
@@ -779,8 +752,8 @@ def eval_val_ttt_lora(
         max_nc = max(num_chunks)
 
         for ci in range(max_nc):
-            chunk_stats = _compute_chunk_window(ci, (ci + 1) * chunk_size, ci + 1, chunk_size, eval_seq_len)
-            context_size, chunk_offset = chunk_stats[1], chunk_stats[2]
+            chunk_stats = compute_chunk_window(ci, (ci + 1) * chunk_size, ci + 1, chunk_size, eval_seq_len)
+            context_size, chunk_offset = chunk_stats.win_len, chunk_stats.chunk_offset
 
             active = [ci < nc for nc in num_chunks]
             needs_train = any(ci < nc - 1 for nc in num_chunks)
@@ -793,7 +766,13 @@ def eval_val_ttt_lora(
                     doc_info.append((0, 0))
                     continue
                 ds, dl = batch[b]
-                ws, wl, co, cl = _compute_chunk_window(ci, pred_lens[b], num_chunks[b], chunk_size, eval_seq_len)
+                window = compute_chunk_window(ci, pred_lens[b], num_chunks[b], chunk_size, eval_seq_len)
+                ws, wl, co, cl = (
+                    window.win_start,
+                    window.win_len,
+                    window.chunk_offset,
+                    window.chunk_len,
+                )
                 chunk = all_tokens[ds + ws: ds + ws + wl + 1]
                 toks = chunk.to(dtype=torch.int64, device=device)
                 x[b, :wl] = toks[:-1]

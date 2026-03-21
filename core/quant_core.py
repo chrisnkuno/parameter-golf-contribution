@@ -83,7 +83,7 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]) -> tuple[QuantizedSt
     dtypes: dict[str, str] = {}
     passthrough: dict[str, Tensor] = {}
     passthrough_orig_dtypes: dict[str, str] = {}
-    qmeta: dict[str, dict[str, object]] = {}
+    qmeta: dict[str, QuantMetaEntry] = {}
     stats = dict.fromkeys(
         ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "int8_payload_bytes"),
         0,

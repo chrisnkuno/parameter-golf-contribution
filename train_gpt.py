@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import copy
 import glob
-import io
 import math
 import os
 import random
@@ -16,7 +15,6 @@ import subprocess
 import sys
 import time
 import uuid
-import zlib
 from pathlib import Path
 
 import numpy as np
@@ -33,6 +31,11 @@ from torch.backends.cuda import (
 )
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+from core.artifact_core import (
+    DEFAULT_QUANT_ARTIFACT_FORMAT,
+    deserialize_quant_artifact,
+    serialize_quant_artifact,
+)
 from core.metric_core import (
     EvalResult,
     compute_loss_byte_deltas,
@@ -116,6 +119,7 @@ class Hyperparameters:
     ttt_chunk_size = int(os.environ.get("TTT_CHUNK_SIZE", 256))
     ttt_eval_seq_len = int(os.environ.get("TTT_EVAL_SEQ_LEN", 1024))
     ttt_batch_size = int(os.environ.get("TTT_BATCH_SIZE", 64))
+    quant_artifact_format = os.environ.get("QUANT_ARTIFACT_FORMAT", DEFAULT_QUANT_ARTIFACT_FORMAT)
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1342,11 +1346,11 @@ def main() -> None:
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
     quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
-    quant_buf = io.BytesIO()
-    torch.save(quant_obj, quant_buf)
-    quant_raw = quant_buf.getvalue()
-    quant_blob = zlib.compress(quant_raw, level=9)
-    quant_raw_bytes = len(quant_raw)
+    quant_blob, quant_raw_bytes = serialize_quant_artifact(
+        quant_obj,
+        args.quant_artifact_format,
+        compression_level=9,
+    )
     if master_process:
         with open("final_model.int8.ptz", "wb") as f:
             f.write(quant_blob)
@@ -1355,7 +1359,8 @@ def main() -> None:
         ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
         log0(
             f"Serialized model int8+zlib: {quant_file_bytes} bytes "
-            f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
+            f"(format:{args.quant_artifact_format} payload:{quant_stats['int8_payload_bytes']} "
+            f"raw_serialized:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
         )
         log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
 
@@ -1363,7 +1368,7 @@ def main() -> None:
         dist.barrier()
     with open("final_model.int8.ptz", "rb") as f:
         quant_blob_disk = f.read()
-    quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
+    quant_state = deserialize_quant_artifact(quant_blob_disk, args.quant_artifact_format)
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()

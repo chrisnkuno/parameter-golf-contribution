@@ -1,5 +1,25 @@
 # Rigorous Math-Driven Approach
 
+Your list:
+
+right architecture
+hyperparameter optimization
+Triton / FA3
+custom artifact writing
+CUDA kernel optimization
+
+That is good, but I would expand it to this:
+
+Architecture
+Model size allocation
+Training recipe / hyperparameters
+Numerical precision and quantization
+Kernel/system efficiency
+Artifact engineering
+Data curriculum / token budget allocation
+Evaluation-specific optimization
+Implementation simplicity / reliability
+
 ## Objective
 
 Produce a submission that is accepted as a new public record on the Parameter Golf leaderboard by optimizing the actual acceptance objective under the exact challenge constraints.

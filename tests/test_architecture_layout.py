@@ -19,6 +19,7 @@ def build_model(**overrides) -> tg.GPT:
         num_untied_tail_blocks=0,
         local_mixer_prefix_layers=0,
         local_mixer_kernel_size=5,
+        zeros_middle_layers=0,
         xsa_tail_layers=0,
         tie_embeddings=True,
         tied_embed_init_std=0.5,
@@ -55,19 +56,59 @@ def test_shared_xsa_requires_enough_untied_tail_layers() -> None:
 def test_local_mixer_marks_only_prefix_layers() -> None:
     model = build_model(local_mixer_prefix_layers=3, xsa_tail_layers=2)
     use_local = [getattr(block.attn, "use_local_mixer", False) for block in model.logical_blocks]
+    use_zeros = [getattr(block.attn, "use_zeros", False) for block in model.logical_blocks]
     use_xsa = [getattr(block.attn, "use_xsa", False) for block in model.logical_blocks]
     assert use_local == [True, True, True, False, False, False, False, False, False]
+    assert use_zeros == [False] * 9
     assert use_xsa == [False, False, False, False, False, False, False, True, True]
 
 
-def test_local_mixer_and_xsa_must_not_overlap() -> None:
-    with pytest.raises(ValueError, match="local_mixer_prefix_layers and xsa_tail_layers must not overlap"):
-        build_model(local_mixer_prefix_layers=6, xsa_tail_layers=4)
+def test_zoned_layout_marks_middle_zeros_layers() -> None:
+    model = build_model(local_mixer_prefix_layers=1, zeros_middle_layers=4, xsa_tail_layers=2)
+    use_local = [getattr(block.attn, "use_local_mixer", False) for block in model.logical_blocks]
+    use_zeros = [getattr(block.attn, "use_zeros", False) for block in model.logical_blocks]
+    use_xsa = [getattr(block.attn, "use_xsa", False) for block in model.logical_blocks]
+    assert use_local == [True, False, False, False, False, False, False, False, False]
+    assert use_zeros == [False, True, True, True, True, False, False, False, False]
+    assert use_xsa == [False, False, False, False, False, False, False, True, True]
+
+
+def test_zone_counts_must_fit_within_num_layers() -> None:
+    with pytest.raises(
+        ValueError,
+        match="local_mixer_prefix_layers, zeros_middle_layers, and xsa_tail_layers must fit within num_layers",
+    ):
+        build_model(local_mixer_prefix_layers=4, zeros_middle_layers=3, xsa_tail_layers=3)
 
 
 def test_local_mixer_not_supported_with_shared_blocks() -> None:
     with pytest.raises(ValueError, match="local_mixer_prefix_layers is not supported with shared blocks yet"):
         build_model(num_shared_blocks=2, num_untied_tail_blocks=4, local_mixer_prefix_layers=2)
+
+
+def test_zeros_not_supported_with_shared_blocks() -> None:
+    with pytest.raises(ValueError, match="zeros_middle_layers is not supported with shared blocks yet"):
+        build_model(num_shared_blocks=2, num_untied_tail_blocks=4, zeros_middle_layers=2)
+
+
+def test_zeros_sm_weights_are_zero_sum_on_causal_prefix() -> None:
+    torch.manual_seed(0)
+    scores = torch.randn(2, 4, 5, 5)
+    gate_first = torch.sigmoid(torch.randn(2, 4, 5))
+    gate_high = torch.sigmoid(torch.randn(2, 4, 5))
+    weights = tg.compute_zeros_sm_weights(scores, gate_first, gate_high)
+    causal = torch.tril(torch.ones((5, 5), dtype=torch.bool))
+    masked = weights.masked_fill(~causal.view(1, 1, 5, 5), 0.0)
+    row_sums = masked.sum(dim=-1)
+    assert torch.allclose(row_sums, torch.zeros_like(row_sums), atol=1e-5, rtol=1e-5)
+
+
+def test_zeros_sm_weights_vanish_for_uniform_logits() -> None:
+    scores = torch.zeros(1, 2, 4, 4)
+    gate_first = torch.full((1, 2, 4), 0.3)
+    gate_high = torch.full((1, 2, 4), 0.7)
+    weights = tg.compute_zeros_sm_weights(scores, gate_first, gate_high)
+    assert torch.allclose(weights, torch.zeros_like(weights), atol=1e-6, rtol=1e-6)
 
 
 def test_apply_xsa_transform_gate_limits() -> None:

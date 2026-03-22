@@ -40,6 +40,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-untied-tail-blocks", type=int, default=0)
     parser.add_argument("--local-mixer-prefix-layers", type=int, default=0)
     parser.add_argument("--local-mixer-kernel-size", type=int, default=5)
+    parser.add_argument("--zeros-middle-layers", type=int, default=0)
     parser.add_argument("--xsa-tail-layers", type=int, default=0)
     parser.add_argument("--tie-embeddings", type=int, default=1)
     parser.add_argument("--tokenizer-path", type=str, default="./data/tokenizers/fineweb_1024_bpe.model")
@@ -66,6 +67,7 @@ def build_args(cli: argparse.Namespace) -> tg.Hyperparameters:
     args.num_untied_tail_blocks = cli.num_untied_tail_blocks
     args.local_mixer_prefix_layers = cli.local_mixer_prefix_layers
     args.local_mixer_kernel_size = cli.local_mixer_kernel_size
+    args.zeros_middle_layers = cli.zeros_middle_layers
     args.xsa_tail_layers = cli.xsa_tail_layers
     args.tie_embeddings = bool(cli.tie_embeddings)
     args.eval_mode = "flat"
@@ -122,6 +124,7 @@ def main() -> None:
         num_untied_tail_blocks=args.num_untied_tail_blocks,
         local_mixer_prefix_layers=args.local_mixer_prefix_layers,
         local_mixer_kernel_size=args.local_mixer_kernel_size,
+        zeros_middle_layers=args.zeros_middle_layers,
         xsa_tail_layers=args.xsa_tail_layers,
         tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std,
@@ -170,6 +173,7 @@ def main() -> None:
                 "num_untied_tail_blocks": cli.num_untied_tail_blocks,
                 "local_mixer_prefix_layers": cli.local_mixer_prefix_layers,
                 "local_mixer_kernel_size": cli.local_mixer_kernel_size,
+                "zeros_middle_layers": cli.zeros_middle_layers,
                 "xsa_tail_layers": cli.xsa_tail_layers,
                 "artifact_raw_serialized_bytes": raw_len,
                 "artifact_compressed_bytes": len(artifact_blob),

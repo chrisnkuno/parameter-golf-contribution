@@ -120,6 +120,11 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    model_avg = os.environ.get("MODEL_AVG", "none").strip().lower()
+    ema_decay = float(os.environ.get("EMA_DECAY", 0.999))
+    ema_start_step = int(os.environ.get("EMA_START_STEP", 1))
+    swa_start_step = int(os.environ.get("SWA_START_STEP", 1))
+    swa_stride = int(os.environ.get("SWA_STRIDE", 1))
 
     # Test-time training (LoRA) hyperparameters.
     ttt_lora_rank = int(os.environ.get("TTT_LORA_RANK", 8))
@@ -566,6 +571,39 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
         for name, param in module.named_parameters():
             if (param.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and param.dtype != torch.float32:
                 param.data = param.data.float()
+
+
+def init_model_avg_state(module: nn.Module) -> dict[str, Tensor]:
+    return {name: param.detach().float().clone() for name, param in module.named_parameters()}
+
+
+def update_ema_state(avg_state: dict[str, Tensor], module: nn.Module, decay: float) -> None:
+    if not 0.0 <= decay < 1.0:
+        raise ValueError(f"ema decay must be in [0, 1), got {decay}")
+    with torch.no_grad():
+        for name, param in module.named_parameters():
+            avg_state[name].mul_(decay).add_(param.detach().float(), alpha=1.0 - decay)
+
+
+def update_swa_state(avg_state: dict[str, Tensor], module: nn.Module, count: int) -> int:
+    with torch.no_grad():
+        if count == 0:
+            for name, param in module.named_parameters():
+                avg_state[name].copy_(param.detach().float())
+            return 1
+        scale = 1.0 / float(count + 1)
+        for name, param in module.named_parameters():
+            avg_state[name].add_(param.detach().float() - avg_state[name], alpha=scale)
+    return count + 1
+
+
+def materialize_averaged_state_dict(module: nn.Module, avg_state: dict[str, Tensor] | None) -> dict[str, Tensor]:
+    state = {name: tensor.detach().cpu().clone() for name, tensor in module.state_dict().items()}
+    if avg_state is None:
+        return state
+    for name, param in module.named_parameters():
+        state[name] = avg_state[name].to(dtype=param.dtype, device="cpu").contiguous()
+    return state
 
 
 class Rotary(nn.Module):
@@ -1343,6 +1381,16 @@ def main() -> None:
     restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
+    if args.model_avg not in {"none", "ema", "swa"}:
+        raise ValueError(f"MODEL_AVG must be one of none/ema/swa, got {args.model_avg!r}")
+    if args.ema_start_step < 1:
+        raise ValueError(f"EMA_START_STEP must be >= 1, got {args.ema_start_step}")
+    if args.swa_start_step < 1:
+        raise ValueError(f"SWA_START_STEP must be >= 1, got {args.swa_start_step}")
+    if args.swa_stride < 1:
+        raise ValueError(f"SWA_STRIDE must be >= 1, got {args.swa_stride}")
+    model_avg_state: dict[str, Tensor] | None = None
+    swa_count = 0
 
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR
@@ -1416,6 +1464,10 @@ def main() -> None:
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+    )
+    log0(
+        f"model_avg:{args.model_avg} ema_decay:{args.ema_decay} ema_start_step:{args.ema_start_step} "
+        f"swa_start_step:{args.swa_start_step} swa_stride:{args.swa_stride}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -1556,6 +1608,17 @@ def main() -> None:
         zero_grad_all()
 
         step += 1
+        if args.model_avg == "ema" and step >= args.ema_start_step:
+            if model_avg_state is None:
+                model_avg_state = init_model_avg_state(base_model)
+            else:
+                update_ema_state(model_avg_state, base_model, args.ema_decay)
+        elif args.model_avg == "swa" and step >= args.swa_start_step and (step - args.swa_start_step) % args.swa_stride == 0:
+            if model_avg_state is None:
+                model_avg_state = init_model_avg_state(base_model)
+                swa_count = 1
+            else:
+                swa_count = update_swa_state(model_avg_state, base_model, swa_count)
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         should_log_train = (
             args.train_log_every > 0
@@ -1586,16 +1649,20 @@ def main() -> None:
     # -----------------------------
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
     # the compressed int8+zlib artifact and validate the round-tripped weights.
+    export_state = materialize_averaged_state_dict(base_model, model_avg_state)
+    if args.model_avg == "swa":
+        log0(f"swa_snapshots:{swa_count}")
+    log0(f"using_export_state:{'averaged' if model_avg_state is not None else 'raw'}")
 
     if master_process:
-        torch.save(base_model.state_dict(), "final_model.pt")
+        torch.save(export_state, "final_model.pt")
         model_bytes = os.path.getsize("final_model.pt")
         code_bytes = len(code.encode("utf-8"))
         log0(f"Serialized model: {model_bytes} bytes")
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
+    quant_obj, quant_stats = quantize_state_dict_int8(export_state)
     quant_blob, quant_raw_bytes = serialize_quant_artifact(
         quant_obj,
         args.quant_artifact_format,

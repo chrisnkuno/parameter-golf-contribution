@@ -72,6 +72,7 @@ class Hyperparameters:
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
+    save_dense_checkpoint_every = int(os.environ.get("SAVE_DENSE_CHECKPOINT_EVERY", 0))
     eval_mode = os.environ.get("EVAL_MODE", "flat")
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", "1024")))
     eval_stride = int(os.environ.get("EVAL_STRIDE", os.environ.get("TRAIN_SEQ_LEN", "1024")))
@@ -1313,6 +1314,19 @@ def main() -> None:
             with open(logfile, "a", encoding="utf-8") as f:
                 print(msg, file=f)
 
+    checkpoint_dir = Path("logs") / "checkpoints"
+
+    def maybe_save_dense_checkpoint(step: int) -> None:
+        if not master_process or args.save_dense_checkpoint_every <= 0 or step <= 0:
+            return
+        if step % args.save_dense_checkpoint_every != 0:
+            return
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint_path = checkpoint_dir / f"{args.run_id}_step{step:05d}.pt"
+        export_state = materialize_averaged_state_dict(base_model, model_avg_state)
+        torch.save(export_state, checkpoint_path)
+        log0(f"dense_checkpoint:{checkpoint_path} bytes:{checkpoint_path.stat().st_size}")
+
     log0(code, console=False)
     log0("=" * 100, console=False)
     log0(f"Running Python {sys.version}", console=False)
@@ -1629,6 +1643,7 @@ def main() -> None:
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
+        maybe_save_dense_checkpoint(step)
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms

@@ -1,0 +1,17 @@
+{
+  "author": "Chris Nkuno",
+  "github_id": "chrisnkuno",
+  "name": "11L + XSA4 H100 Legal Frontier",
+  "blurb": "Single-H100 non-record submission using an 11-layer decoder-only transformer with XSA in the final 4 layers. The best legal checkpoint was selected from a 25-step frontier and packaged with packed_zstd plus no_default_large_keeps to stay under the 16,000,000-byte cap.",
+  "date": "2026-03-23T14:22:00Z",
+  "track": "non-record-16mb",
+  "val_loss": 2.46718130,
+  "val_bpb": 1.46120374,
+  "pre_quant_val_loss": 2.4650,
+  "pre_quant_val_bpb": 1.4599,
+  "step_stop": 650,
+  "wallclock_seconds": 252.431,
+  "bytes_total": 15983603,
+  "bytes_model_int8_zlib": 15907290,
+  "bytes_code": 76313
+}

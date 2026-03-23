@@ -1,0 +1,8 @@
+torch
+sentencepiece
+numpy
+datasets
+huggingface-hub
+tqdm
+tiktoken
+zstandard

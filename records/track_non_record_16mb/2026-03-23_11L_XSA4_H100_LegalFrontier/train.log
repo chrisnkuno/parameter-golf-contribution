@@ -1,0 +1,83 @@
+NOTE: This log was reconstructed from the live H100 session output captured during the run after the pod endpoint became unavailable again. Replace it with a direct remote copy if the pod is still accessible.
+
+warmup_step:1/20
+warmup_step:2/20
+warmup_step:3/20
+warmup_step:4/20
+warmup_step:5/20
+warmup_step:6/20
+warmup_step:7/20
+warmup_step:8/20
+warmup_step:9/20
+warmup_step:10/20
+warmup_step:11/20
+warmup_step:12/20
+warmup_step:13/20
+warmup_step:14/20
+warmup_step:15/20
+warmup_step:16/20
+warmup_step:17/20
+warmup_step:18/20
+warmup_step:19/20
+warmup_step:20/20
+step:1/650 train_loss:6.9360 train_time:374ms step_avg:374.45ms
+step:2/650 train_loss:16.3028 train_time:744ms step_avg:371.83ms
+step:3/650 train_loss:8.4191 train_time:1114ms step_avg:371.27ms
+step:4/650 train_loss:6.6672 train_time:1485ms step_avg:371.19ms
+step:5/650 train_loss:6.7931 train_time:1855ms step_avg:370.96ms
+step:6/650 train_loss:6.8103 train_time:2235ms step_avg:372.54ms
+step:7/650 train_loss:6.4342 train_time:2605ms step_avg:372.15ms
+step:8/650 train_loss:6.2321 train_time:2975ms step_avg:371.89ms
+step:9/650 train_loss:6.0933 train_time:3346ms step_avg:371.72ms
+step:10/650 train_loss:5.9949 train_time:3721ms step_avg:372.13ms
+dense_checkpoint:logs/checkpoints/11l_xsa4_h100_scored_step00025.pt bytes:81927437
+step:50/650 train_loss:3.9115 train_time:18853ms step_avg:377.06ms
+dense_checkpoint:logs/checkpoints/11l_xsa4_h100_scored_step00050.pt bytes:81927437
+dense_checkpoint:logs/checkpoints/11l_xsa4_h100_scored_step00075.pt bytes:81927437
+step:100/650 train_loss:3.3336 train_time:38352ms step_avg:383.52ms
+dense_checkpoint:logs/checkpoints/11l_xsa4_h100_scored_step00100.pt bytes:81927437
+dense_checkpoint:logs/checkpoints/11l_xsa4_h100_scored_step00125.pt bytes:81927437
+step:150/650 train_loss:3.1054 train_time:57733ms step_avg:384.88ms
+dense_checkpoint:logs/checkpoints/11l_xsa4_h100_scored_step00150.pt bytes:81927437
+dense_checkpoint:logs/checkpoints/11l_xsa4_h100_scored_step00175.pt bytes:81927437
+step:200/650 train_loss:2.8970 train_time:77220ms step_avg:386.10ms
+dense_checkpoint:logs/checkpoints/11l_xsa4_h100_scored_step00200.pt bytes:81927437
+dense_checkpoint:logs/checkpoints/11l_xsa4_h100_scored_step00225.pt bytes:81927437
+step:250/650 train_loss:2.7665 train_time:96599ms step_avg:386.39ms
+dense_checkpoint:logs/checkpoints/11l_xsa4_h100_scored_step00250.pt bytes:81927437
+dense_checkpoint:logs/checkpoints/11l_xsa4_h100_scored_step00275.pt bytes:81927437
+step:300/650 train_loss:2.7406 train_time:116054ms step_avg:386.85ms
+dense_checkpoint:logs/checkpoints/11l_xsa4_h100_scored_step00300.pt bytes:81927437
+dense_checkpoint:logs/checkpoints/11l_xsa4_h100_scored_step00325.pt bytes:81927437
+step:350/650 train_loss:2.6774 train_time:135338ms step_avg:386.68ms
+dense_checkpoint:logs/checkpoints/11l_xsa4_h100_scored_step00350.pt bytes:81927437
+dense_checkpoint:logs/checkpoints/11l_xsa4_h100_scored_step00375.pt bytes:81927437
+step:400/650 train_loss:2.6559 train_time:155080ms step_avg:387.70ms
+dense_checkpoint:logs/checkpoints/11l_xsa4_h100_scored_step00400.pt bytes:81927437
+dense_checkpoint:logs/checkpoints/11l_xsa4_h100_scored_step00425.pt bytes:81927437
+step:450/650 train_loss:2.6305 train_time:174504ms step_avg:387.79ms
+dense_checkpoint:logs/checkpoints/11l_xsa4_h100_scored_step00450.pt bytes:81927437
+dense_checkpoint:logs/checkpoints/11l_xsa4_h100_scored_step00475.pt bytes:81927437
+step:500/650 train_loss:2.5787 train_time:193903ms step_avg:387.81ms
+dense_checkpoint:logs/checkpoints/11l_xsa4_h100_scored_step00500.pt bytes:81927437
+dense_checkpoint:logs/checkpoints/11l_xsa4_h100_scored_step00525.pt bytes:81927437
+step:550/650 train_loss:2.4825 train_time:213171ms step_avg:387.58ms
+dense_checkpoint:logs/checkpoints/11l_xsa4_h100_scored_step00550.pt bytes:81927437
+dense_checkpoint:logs/checkpoints/11l_xsa4_h100_scored_step00575.pt bytes:81927437
+step:600/650 train_loss:2.5216 train_time:232534ms step_avg:387.56ms
+dense_checkpoint:logs/checkpoints/11l_xsa4_h100_scored_step00600.pt bytes:81927437
+dense_checkpoint:logs/checkpoints/11l_xsa4_h100_scored_step00625.pt bytes:81927437
+step:650/650 train_loss:2.4396 train_time:251964ms step_avg:387.64ms
+dense_checkpoint:logs/checkpoints/11l_xsa4_h100_scored_step00650.pt bytes:81927437
+step:650/650 val_loss:2.4650 val_bpb:1.4599 train_time:252431ms step_avg:388.36ms
+step:650/650 val_raw loss_sum:152883219.90625000 token_count:62021632 byte_count:151080363 tokens_per_byte:0.41052080
+peak memory allocated: 13451 MiB reserved: 13496 MiB
+using_export_state:raw
+Serialized model: 81925055 bytes
+Code size: 76313 bytes
+Total submission size: 82001368 bytes
+Serialized model int8+zlib: 16215347 bytes (format:packed_zstd scale_codec:raw payload:21402016 raw_serialized:21430741 payload_ratio:3.83x)
+Total submission size int8+zlib: 16291660 bytes
+final_int8_zlib_roundtrip val_loss:2.4657 val_bpb:1.4603 eval_time:11540ms
+final_int8_zlib_roundtrip_exact val_loss:2.46568512 val_bpb:1.46031761
+final_int8_zlib_roundtrip_raw loss_sum:152925815.19726562 token_count:62021632 byte_count:151080363 tokens_per_byte:0.41052080

@@ -32,6 +32,33 @@ python scripts/allocation_rank.py \
   --output /tmp/allocation_rank.json
 ```
 
+Checkpoint diff:
+
+```bash
+python scripts/compare_allocation_rank.py \
+  --baseline path/to/legal_checkpoint.pt \
+  --candidate path/to/raw_checkpoint.pt \
+  --output /tmp/allocation_diff.json
+```
+
+Unified bundle:
+
+```bash
+python scripts/checkpoint_analysis.py \
+  --baseline path/to/legal_checkpoint.pt \
+  --candidate path/to/raw_checkpoint.pt \
+  --output-dir /tmp/checkpoint_analysis
+```
+
+This writes:
+
+- `baseline_tensor_report.json`
+- `baseline_tensor_report.html`
+- `baseline_allocation_rank.json`
+- `candidate_*` equivalents when provided
+- `allocation_diff.json`
+- `summary.md`
+
 This reports:
 
 - per-tensor bytes
@@ -71,6 +98,14 @@ These define:
 - benchmark defaults
 - Triton availability checks
 - a first real kernel target: forward `RMSNorm`
+
+Current Triton RMSNorm scope:
+
+- forward-only
+- eager/inference-only integration path
+- last dimension must be contiguous
+- hidden size must be `<= 4096`
+- intended for repo-realistic widths like `64` and `512`, not arbitrary giant hidden sizes
 
 ## Triton Verification Loop
 
@@ -148,10 +183,11 @@ Use challenge-relevant shapes taken from:
    - current legal checkpoint
    - current best raw checkpoint
 2. Run `scripts/allocation_rank.py` on the same checkpoints
-3. identify the top byte-heavy tensors and numerically extreme tensors
-4. choose one small Triton candidate with a clean PyTorch reference
-5. build correctness tests before optimization
-6. only then add performance profiling and autotuning
+3. Run `scripts/compare_allocation_rank.py` to diff legal vs raw checkpoints
+4. identify the top byte-heavy tensors and numerically extreme tensors
+5. choose one small Triton candidate with a clean PyTorch reference
+6. build correctness tests before optimization
+7. only then add performance profiling and autotuning
 
 ## Source Guidance
 

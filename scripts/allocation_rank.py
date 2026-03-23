@@ -3,12 +3,11 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import sys
 from typing import Any
 
-import torch
-from torch import Tensor
-
-from core.tensor_report import state_dict_report
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
 DEFAULT_TRAFFIC_HINTS: dict[str, float] = {
@@ -43,13 +42,15 @@ DEFAULT_SENSITIVITY_HINTS: dict[str, float] = {
 }
 
 
-def _extract_state_dict(obj: Any) -> dict[str, Tensor]:
-    if isinstance(obj, dict) and all(isinstance(v, Tensor) for v in obj.values()):
+def _extract_state_dict(obj: Any) -> dict[str, Any]:
+    import torch
+
+    if isinstance(obj, dict) and all(isinstance(v, torch.Tensor) for v in obj.values()):
         return obj
     if isinstance(obj, dict):
         for key in ("state_dict", "model", "model_state_dict"):
             value = obj.get(key)
-            if isinstance(value, dict) and all(isinstance(v, Tensor) for v in value.values()):
+            if isinstance(value, dict) and all(isinstance(v, torch.Tensor) for v in value.values()):
                 return value
     raise TypeError("Could not extract a tensor-only state_dict from the provided object")
 
@@ -63,8 +64,42 @@ def _lookup_hint(name: str, table: dict[str, float], default: float) -> float:
 
 def _residency(name: str) -> str:
     if any(pattern in name for pattern in ("running_", "momentum_buffer", "avg_state")):
-        return "persistent"
-    return "persistent"
+        return "persistent_state"
+    if any(pattern in name for pattern in ("attn_scale", "mlp_scale", "resid_mix", "skip_weight", "q_gain")):
+        return "persistent_control"
+    return "persistent_weight"
+
+
+def _role(name: str) -> str:
+    if "tok_emb.weight" in name or "lm_head" in name:
+        return "embedding_io"
+    if "attn." in name:
+        return "attention"
+    if "mlp." in name:
+        return "mlp"
+    if any(pattern in name for pattern in ("attn_scale", "mlp_scale", "resid_mix", "skip_weight", "q_gain")):
+        return "control"
+    return "other"
+
+
+def _recommended_action(
+    *,
+    role: str,
+    traffic: float,
+    sensitivity: float,
+    nbytes: int,
+) -> str:
+    if role == "embedding_io":
+        return "protect_precision_or_precondition"
+    if traffic >= 4.0 and role in {"attention", "mlp"}:
+        return "kernel_or_fusion_candidate"
+    if sensitivity >= 2.0 and nbytes >= 1_000_000:
+        return "precondition_or_mixed_precision"
+    if nbytes >= 1_000_000:
+        return "quant_layout_candidate"
+    if role == "control":
+        return "keep_precise"
+    return "inspect"
 
 
 def rank_report(report: dict[str, Any]) -> dict[str, Any]:
@@ -74,6 +109,7 @@ def rank_report(report: dict[str, Any]) -> dict[str, Any]:
         sensitivity = _lookup_hint(item["name"], DEFAULT_SENSITIVITY_HINTS, 1.0)
         zero_penalty = max(1.0 - float(item["zero_frac"]), 0.05)
         priority = float(item["nbytes"]) * traffic * sensitivity * zero_penalty
+        role = _role(item["name"])
         ranked.append(
             {
                 "name": item["name"],
@@ -84,6 +120,13 @@ def rank_report(report: dict[str, Any]) -> dict[str, Any]:
                 "sensitivity_hint": sensitivity,
                 "zero_frac": item["zero_frac"],
                 "residency": _residency(item["name"]),
+                "role": role,
+                "recommended_action": _recommended_action(
+                    role=role,
+                    traffic=traffic,
+                    sensitivity=sensitivity,
+                    nbytes=int(item["nbytes"]),
+                ),
                 "priority_score": priority,
             }
         )
@@ -103,6 +146,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    import torch
+
+    from core.tensor_report import state_dict_report
+
     args = parse_args()
     obj = torch.load(args.input, map_location="cpu")
     state_dict = _extract_state_dict(obj)

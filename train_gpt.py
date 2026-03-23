@@ -49,6 +49,7 @@ from core.quant_core import (
     quantize_state_dict_int8,
 )
 from core.schedule_core import compute_chunk_window, find_docs
+from core.triton_rmsnorm import has_triton_rmsnorm, supports_triton_rmsnorm_shape, triton_rmsnorm
 
 # -----------------------------
 # HYPERPARAMETERS
@@ -136,6 +137,8 @@ class Hyperparameters:
     run_ttt_eval = bool(int(os.environ.get("RUN_TTT_EVAL", "1")))
     quant_artifact_format = os.environ.get("QUANT_ARTIFACT_FORMAT", DEFAULT_QUANT_ARTIFACT_FORMAT)
     packed_scale_codec = os.environ.get("PACKED_SCALE_CODEC", DEFAULT_PACKED_SCALE_CODEC)
+    use_triton_rmsnorm = bool(int(os.environ.get("USE_TRITON_RMSNORM", "0")))
+    compile_model = bool(int(os.environ.get("COMPILE_MODEL", "1")))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -556,7 +559,21 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: Tensor) -> Tensor:
-        return F.rms_norm(x, (x.size(-1),), eps=self.eps)
+        return rms_norm_op(x, eps=self.eps)
+
+
+def rms_norm_op(x: Tensor, eps: float | None = None) -> Tensor:
+    resolved_eps = torch.finfo(x.dtype).eps if eps is None else eps
+    use_triton = (
+        Hyperparameters.use_triton_rmsnorm
+        and x.is_cuda
+        and has_triton_rmsnorm()
+        and supports_triton_rmsnorm_shape(x)
+        and (torch.is_inference_mode_enabled() or not torch.is_grad_enabled())
+    )
+    if use_triton:
+        return triton_rmsnorm(x, eps=resolved_eps)
+    return F.rms_norm(x, (x.size(-1),), eps=resolved_eps)
 
 
 class CastedLinear(nn.Linear):
@@ -740,8 +757,8 @@ class ZeroSSoftmaxAttention(nn.Module):
         q = q.reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
         k = k.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = v.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        q = F.rms_norm(q, (q.size(-1),))
-        k = F.rms_norm(k, (k.size(-1),))
+        q = rms_norm_op(q)
+        k = rms_norm_op(k)
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
@@ -799,8 +816,8 @@ class CausalSelfAttention(nn.Module):
         q = q.reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
         k = k.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = v.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        q = F.rms_norm(q, (q.size(-1),))
-        k = F.rms_norm(k, (k.size(-1),))
+        q = rms_norm_op(q)
+        k = rms_norm_op(k)
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
@@ -1009,7 +1026,7 @@ class GPT(nn.Module):
 
     def forward_logits(self, input_ids: Tensor, lora=None) -> Tensor:
         x = self.tok_emb(input_ids)
-        x = F.rms_norm(x, (x.size(-1),))
+        x = rms_norm_op(x)
         x0 = x
         skips: list[Tensor] = []
 
@@ -1290,6 +1307,9 @@ def main() -> None:
         dist.barrier()
     master_process = rank == 0
 
+    if args.use_triton_rmsnorm and args.compile_model:
+        raise ValueError("USE_TRITON_RMSNORM=1 currently requires COMPILE_MODEL=0")
+
     # Fast math knobs
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -1393,7 +1413,11 @@ def main() -> None:
         if isinstance(module, Rotary):
             module.inv_freq.data = module.inv_freq.data.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    compiled_model = (
+        torch.compile(base_model, dynamic=False, fullgraph=True)
+        if args.compile_model
+        else base_model
+    )
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
     if args.model_avg not in {"none", "ema", "swa"}:
         raise ValueError(f"MODEL_AVG must be one of none/ema/swa, got {args.model_avg!r}")
@@ -1482,6 +1506,10 @@ def main() -> None:
     log0(
         f"model_avg:{args.model_avg} ema_decay:{args.ema_decay} ema_start_step:{args.ema_start_step} "
         f"swa_start_step:{args.swa_start_step} swa_stride:{args.swa_stride}"
+    )
+    log0(
+        f"compile_model:{args.compile_model} use_triton_rmsnorm:{args.use_triton_rmsnorm} "
+        f"triton_rmsnorm_available:{has_triton_rmsnorm()}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "

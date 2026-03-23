@@ -24,6 +24,14 @@ python scripts/tensor_report.py \
   --output-html /tmp/report.html
 ```
 
+Allocation ranking:
+
+```bash
+python scripts/allocation_rank.py \
+  --input path/to/checkpoint.pt \
+  --output /tmp/allocation_rank.json
+```
+
 This reports:
 
 - per-tensor bytes
@@ -40,6 +48,7 @@ Start with:
 - quantization scales / passthrough tensors
 
 The point is to make byte-heavy or numerically awkward tensors obvious before changing quantization or kernel layout.
+Use `ALLOCATION_POLICY.md` and `scripts/allocation_rank.py` to convert that inspection into a prioritized optimization list.
 
 ### Triton harness
 
@@ -138,10 +147,11 @@ Use challenge-relevant shapes taken from:
 1. Run `scripts/tensor_report.py` on:
    - current legal checkpoint
    - current best raw checkpoint
-2. identify the top byte-heavy tensors and numerically extreme tensors
-3. choose one small Triton candidate with a clean PyTorch reference
-4. build correctness tests before optimization
-5. only then add performance profiling and autotuning
+2. Run `scripts/allocation_rank.py` on the same checkpoints
+3. identify the top byte-heavy tensors and numerically extreme tensors
+4. choose one small Triton candidate with a clean PyTorch reference
+5. build correctness tests before optimization
+6. only then add performance profiling and autotuning
 
 ## Source Guidance
 

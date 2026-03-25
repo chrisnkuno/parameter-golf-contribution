@@ -103,9 +103,16 @@ class Hyperparameters:
     local_mixer_kernel_size = int(os.environ.get("LOCAL_MIXER_KERNEL_SIZE", 5))
     zeros_middle_layers = int(os.environ.get("ZEROS_MIDDLE_LAYERS", 0))
     xsa_tail_layers = int(os.environ.get("XSA_TAIL_LAYERS", 0))
+    use_attention_gate = bool(int(os.environ.get("USE_ATTENTION_GATE", "0")))
+    use_value_residual = bool(int(os.environ.get("USE_VALUE_RESIDUAL", "0")))
+    hash_ngram_order = int(os.environ.get("HASH_NGRAM_ORDER", 0))
+    hash_vocab_size = int(os.environ.get("HASH_VOCAB_SIZE", 0))
+    hash_embed_dim = int(os.environ.get("HASH_EMBED_DIM", 0))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    mlp_activation = os.environ.get("MLP_ACTIVATION", "relu2").strip().lower()
+    leaky_relu_negative_slope = float(os.environ.get("LEAKY_RELU_NEGATIVE_SLOPE", 0.5))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -553,6 +560,43 @@ class DistributedTokenLoader:
 # TRANSFORMER MODULES
 # -----------------------------
 
+
+def compute_ngram_hash_ids(input_ids: Tensor, order: int, vocab_size: int) -> Tensor:
+    if order < 2:
+        raise ValueError(f"hash ngram order must be >= 2, got {order}")
+    if vocab_size <= 0:
+        raise ValueError(f"hash vocab size must be positive, got {vocab_size}")
+    if input_ids.ndim != 2:
+        raise ValueError(f"expected rank-2 input_ids, got shape {tuple(input_ids.shape)}")
+    bsz, seqlen = input_ids.shape
+    history = []
+    for shift in range(order - 1, 0, -1):
+        shifted = torch.full_like(input_ids, BOS_ID)
+        shifted[:, shift:] = input_ids[:, :-shift]
+        history.append(shifted)
+    history.append(input_ids)
+    stacked = torch.stack(history, dim=0).to(torch.int64)
+    multipliers = torch.tensor([1009**i for i in range(order)], device=input_ids.device, dtype=torch.int64)
+    hashed = (stacked * multipliers.view(order, 1, 1)).sum(dim=0)
+    return torch.remainder(hashed, vocab_size).to(torch.int64).reshape(bsz, seqlen)
+
+
+class HashNGramEmbedding(nn.Module):
+    def __init__(self, num_buckets: int, embed_dim: int, model_dim: int, order: int):
+        super().__init__()
+        if order < 2:
+            raise ValueError(f"HashNGramEmbedding order must be >= 2, got {order}")
+        self.num_buckets = num_buckets
+        self.order = order
+        self.embed = nn.Embedding(num_buckets, embed_dim)
+        self.proj = CastedLinear(embed_dim, model_dim, bias=False)
+        self.proj._zero_init = True
+
+    def forward(self, input_ids: Tensor) -> Tensor:
+        hashed_ids = compute_ngram_hash_ids(input_ids, self.order, self.num_buckets)
+        return self.proj(self.embed(hashed_ids))
+
+
 class RMSNorm(nn.Module):
     def __init__(self, eps: float | None = None):
         super().__init__()
@@ -724,6 +768,8 @@ class ZeroSSoftmaxAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        use_attention_gate: bool = False,
+        use_value_residual: bool = False,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -745,6 +791,13 @@ class ZeroSSoftmaxAttention(nn.Module):
         self.rotary = Rotary(self.head_dim, base=rope_base)
         self.gate_first = CastedLinear(dim, num_heads, bias=False)
         self.gate_high = CastedLinear(dim, num_heads, bias=False)
+        self.use_attention_gate = use_attention_gate
+        self.use_value_residual = use_value_residual
+        self.attn_gate = CastedLinear(dim, num_heads, bias=False) if use_attention_gate else None
+        self.value_resid_proj = CastedLinear(kv_dim, dim, bias=False) if use_value_residual else None
+        self.value_resid_gain = (
+            nn.Parameter(torch.zeros(dim, dtype=torch.float32)) if use_value_residual else None
+        )
         self.use_xsa = False
         self.use_local_mixer = False
         self.use_zeros = True
@@ -769,9 +822,15 @@ class ZeroSSoftmaxAttention(nn.Module):
         gate_first = torch.sigmoid(self.gate_first(x).transpose(1, 2).to(dtype=scores.dtype))
         gate_high = torch.sigmoid(self.gate_high(x).transpose(1, 2).to(dtype=scores.dtype))
         weights = compute_zeros_sm_weights(scores, gate_first, gate_high)
+        if self.use_attention_gate and self.attn_gate is not None:
+            weights = weights * torch.sigmoid(self.attn_gate(x).transpose(1, 2).to(dtype=weights.dtype))[..., None]
         y = torch.matmul(weights.to(dtype=v_full.dtype), v_full)
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
-        return self.proj(y)
+        out = self.proj(y)
+        if self.use_value_residual and self.value_resid_proj is not None and self.value_resid_gain is not None:
+            v_resid = self.value_resid_proj(v.transpose(1, 2).contiguous().reshape(bsz, seqlen, -1))
+            out = out + self.value_resid_gain.to(dtype=out.dtype)[None, None, :] * v_resid
+        return out
 
 
 class CausalSelfAttention(nn.Module):
@@ -783,6 +842,8 @@ class CausalSelfAttention(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         use_xsa: bool = False,
+        use_attention_gate: bool = False,
+        use_value_residual: bool = False,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -803,6 +864,13 @@ class CausalSelfAttention(nn.Module):
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
         self.use_xsa = use_xsa
+        self.use_attention_gate = use_attention_gate
+        self.use_value_residual = use_value_residual
+        self.attn_gate = CastedLinear(dim, num_heads, bias=False) if use_attention_gate else None
+        self.value_resid_proj = CastedLinear(kv_dim, dim, bias=False) if use_value_residual else None
+        self.value_resid_gain = (
+            nn.Parameter(torch.zeros(dim, dtype=torch.float32)) if use_value_residual else None
+        )
         self.use_local_mixer = False
         if use_xsa:
             # Start close to standard attention, then let training learn how much exclusivity each head wants.
@@ -830,24 +898,51 @@ class CausalSelfAttention(nn.Module):
             is_causal=True,
             enable_gqa=(self.num_kv_heads != self.num_heads),
         )
+        if self.use_attention_gate and self.attn_gate is not None:
+            y = y * torch.sigmoid(self.attn_gate(x).transpose(1, 2).to(dtype=y.dtype))[..., None]
         if self.use_xsa:
             y = apply_xsa_transform(y, v, self.num_heads, self.num_kv_heads, self.xsa_gate)
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
-        return self.proj(y)
+        out = self.proj(y)
+        if self.use_value_residual and self.value_resid_proj is not None and self.value_resid_gain is not None:
+            v_resid = self.value_resid_proj(v.transpose(1, 2).contiguous().reshape(bsz, seqlen, -1))
+            out = out + self.value_resid_gain.to(dtype=out.dtype)[None, None, :] * v_resid
+        return out
 
 
 class MLP(nn.Module):
     # relu^2 MLP from the original modded-nanogpt setup
-    def __init__(self, dim: int, mlp_mult: int, mlp_hidden: int = 0):
+    def __init__(
+        self,
+        dim: int,
+        mlp_mult: int,
+        mlp_hidden: int = 0,
+        activation: str = "relu2",
+        leaky_relu_negative_slope: float = 0.5,
+    ):
         super().__init__()
         hidden = mlp_hidden if mlp_hidden > 0 else mlp_mult * dim
-        self.fc = CastedLinear(dim, hidden, bias=False)
+        self.activation = activation
+        self.leaky_relu_negative_slope = leaky_relu_negative_slope
+        if activation == "swiglu":
+            self.fc = CastedLinear(dim, 2 * hidden, bias=False)
+        else:
+            self.fc = CastedLinear(dim, hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
-        return self.proj(x.square())
+        x = self.fc(x)
+        if self.activation == "relu2":
+            x = torch.relu(x).square()
+        elif self.activation == "leaky_relu2":
+            x = F.leaky_relu(x, negative_slope=self.leaky_relu_negative_slope).square()
+        elif self.activation == "swiglu":
+            x_gate, x_val = x.chunk(2, dim=-1)
+            x = F.silu(x_gate) * x_val
+        else:
+            raise ValueError(f"Unsupported MLP activation {self.activation!r}")
+        return self.proj(x)
 
 
 class Block(nn.Module):
@@ -864,6 +959,10 @@ class Block(nn.Module):
         use_xsa: bool = False,
         use_local_mixer: bool = False,
         use_zeros: bool = False,
+        use_attention_gate: bool = False,
+        use_value_residual: bool = False,
+        mlp_activation: str = "relu2",
+        leaky_relu_negative_slope: float = 0.5,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -871,10 +970,33 @@ class Block(nn.Module):
         if use_local_mixer:
             self.attn = CheapLocalMixer(dim, local_mixer_kernel_size)
         elif use_zeros:
-            self.attn = ZeroSSoftmaxAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+            self.attn = ZeroSSoftmaxAttention(
+                dim,
+                num_heads,
+                num_kv_heads,
+                rope_base,
+                qk_gain_init,
+                use_attention_gate=use_attention_gate,
+                use_value_residual=use_value_residual,
+            )
         else:
-            self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, use_xsa=use_xsa)
-        self.mlp = MLP(dim, mlp_mult, mlp_hidden=mlp_hidden)
+            self.attn = CausalSelfAttention(
+                dim,
+                num_heads,
+                num_kv_heads,
+                rope_base,
+                qk_gain_init,
+                use_xsa=use_xsa,
+                use_attention_gate=use_attention_gate,
+                use_value_residual=use_value_residual,
+            )
+        self.mlp = MLP(
+            dim,
+            mlp_mult,
+            mlp_hidden=mlp_hidden,
+            activation=mlp_activation,
+            leaky_relu_negative_slope=leaky_relu_negative_slope,
+        )
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -907,6 +1029,13 @@ class GPT(nn.Module):
         local_mixer_kernel_size: int,
         zeros_middle_layers: int,
         xsa_tail_layers: int,
+        use_attention_gate: bool,
+        use_value_residual: bool,
+        hash_ngram_order: int,
+        hash_vocab_size: int,
+        hash_embed_dim: int,
+        mlp_activation: str,
+        leaky_relu_negative_slope: float,
         tie_embeddings: bool,
         tied_embed_init_std: float,
         logit_softcap: float,
@@ -949,6 +1078,12 @@ class GPT(nn.Module):
         self.local_mixer_kernel_size = local_mixer_kernel_size
         self.zeros_middle_layers = zeros_middle_layers
         self.xsa_tail_layers = xsa_tail_layers
+        self.use_attention_gate = use_attention_gate
+        self.use_value_residual = use_value_residual
+        self.hash_ngram_order = hash_ngram_order
+        self.hash_vocab_size = hash_vocab_size
+        self.hash_embed_dim = hash_embed_dim
+        self.mlp_activation = mlp_activation
         self.num_shared_prefix_layers = num_layers - num_untied_tail_blocks if num_shared_blocks > 0 else 0
         if num_shared_blocks > 0 and self.num_shared_prefix_layers <= 0:
             raise ValueError("num_shared_blocks requires at least one shared-prefix layer")
@@ -966,6 +1101,12 @@ class GPT(nn.Module):
             raise ValueError("local_mixer_prefix_layers is not supported with shared blocks yet")
         if num_shared_blocks > 0 and zeros_middle_layers > 0:
             raise ValueError("zeros_middle_layers is not supported with shared blocks yet")
+        if hash_ngram_order not in {0, 2, 3}:
+            raise ValueError(f"hash_ngram_order must be one of 0, 2, 3, got {hash_ngram_order}")
+        if hash_ngram_order == 0 and (hash_vocab_size > 0 or hash_embed_dim > 0):
+            raise ValueError("hash_vocab_size/hash_embed_dim require hash_ngram_order > 0")
+        if hash_ngram_order > 0 and (hash_vocab_size <= 0 or hash_embed_dim <= 0):
+            raise ValueError("hash_ngram_order > 0 requires positive hash_vocab_size and hash_embed_dim")
 
         def make_block(*, use_xsa: bool, use_local_mixer: bool, use_zeros: bool) -> Block:
             return Block(
@@ -980,6 +1121,10 @@ class GPT(nn.Module):
                 use_xsa=use_xsa,
                 use_local_mixer=use_local_mixer,
                 use_zeros=use_zeros,
+                use_attention_gate=use_attention_gate,
+                use_value_residual=use_value_residual,
+                mlp_activation=mlp_activation,
+                leaky_relu_negative_slope=leaky_relu_negative_slope,
             )
 
         if num_shared_blocks > 0:
@@ -1011,6 +1156,11 @@ class GPT(nn.Module):
             self.logical_blocks = list(self.blocks)
         if len(self.logical_blocks) != num_layers:
             raise RuntimeError(f"logical block layout mismatch: expected {num_layers}, got {len(self.logical_blocks)}")
+        self.hash_embed = (
+            HashNGramEmbedding(hash_vocab_size, hash_embed_dim, model_dim, hash_ngram_order)
+            if hash_ngram_order > 0
+            else None
+        )
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -1026,6 +1176,8 @@ class GPT(nn.Module):
 
     def forward_logits(self, input_ids: Tensor, lora=None) -> Tensor:
         x = self.tok_emb(input_ids)
+        if self.hash_embed is not None:
+            x = x + self.hash_embed(input_ids).to(dtype=x.dtype)
         x = rms_norm_op(x)
         x0 = x
         skips: list[Tensor] = []
@@ -1401,6 +1553,13 @@ def main() -> None:
         local_mixer_kernel_size=args.local_mixer_kernel_size,
         zeros_middle_layers=args.zeros_middle_layers,
         xsa_tail_layers=args.xsa_tail_layers,
+        use_attention_gate=args.use_attention_gate,
+        use_value_residual=args.use_value_residual,
+        hash_ngram_order=args.hash_ngram_order,
+        hash_vocab_size=args.hash_vocab_size,
+        hash_embed_dim=args.hash_embed_dim,
+        mlp_activation=args.mlp_activation,
+        leaky_relu_negative_slope=args.leaky_relu_negative_slope,
         tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
@@ -1498,6 +1657,15 @@ def main() -> None:
         f"registered_blocks:{len(base_model.blocks)} logical_blocks:{len(base_model.logical_blocks)}"
     )
     log0(f"xsa_tail_layers:{args.xsa_tail_layers}")
+    log0(
+        f"use_attention_gate:{args.use_attention_gate} use_value_residual:{args.use_value_residual} "
+        f"hash_ngram_order:{args.hash_ngram_order} hash_vocab_size:{args.hash_vocab_size} "
+        f"hash_embed_dim:{args.hash_embed_dim}"
+    )
+    log0(
+        f"mlp_activation:{args.mlp_activation} "
+        f"leaky_relu_negative_slope:{args.leaky_relu_negative_slope}"
+    )
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "

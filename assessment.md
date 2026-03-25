@@ -93,3 +93,53 @@ Highest-value data-handling work:
 2. Benchmark Triton `RMSNorm` on actual repo shapes.
 3. Integrate Triton `RMSNorm` only in eager/inference mode.
 4. Start a wider-MLP + stronger low-bit branch once the observability loop is working.
+
+Running Baseline on 2×RTX 5090
+Here's what the repo does and what you need to adapt for 2×5090.
+
+How Distributed Training Works
+In train_gpt.py main(), the key constraint is:
+
+python
+if 8 % world_size != 0:
+    raise ValueError(f"WORLD_SIZE={world_size} must divide 8 so grad_accum_steps stays integral")
+grad_accum_steps = 8 // world_size
+So valid world sizes are: 1, 2, 4, 8. For 2×5090 → nproc_per_node=2, grad_accum_steps=4 (same effective batch size as 8xH100, just 4 microsteps per GPU instead of 1).
+
+Training uses standard torchrun + DDP. No code edits needed.
+
+Baseline Command for 2×5090
+bash
+# 1. Download data (one-time)
+python3 data/cached_challenge_fineweb.py --variant sp1024
+# 2. Run baseline
+RUN_ID=baseline_2x5090 \
+DATA_PATH=./data/datasets/fineweb10B_sp1024 \
+TOKENIZER_PATH=./data/tokenizers/fineweb_1024_bpe.model \
+VOCAB_SIZE=1024 \
+MAX_WALLCLOCK_SECONDS=600 \
+VAL_LOSS_EVERY=200 \
+TRAIN_LOG_EVERY=50 \
+NCCL_IB_DISABLE=1 \
+torchrun --standalone --nproc_per_node=2 train_gpt.py
+That's it — no model config changes needed. The 8xH100 baseline config defaults are:
+
+VOCAB_SIZE=1024 NUM_LAYERS=9 MODEL_DIM=512 NUM_HEADS=8 NUM_KV_HEADS=4 MLP_MULT=2
+TRAIN_BATCH_TOKENS=524288 TRAIN_SEQ_LEN=1024 TIE_EMBEDDINGS=1
+What to Expect vs 8×H100
+8×H100 baseline	2×5090
+grad_accum_steps	1	4
+step_avg	~43.5 ms	slower (4 microsteps + weaker interconnect)
+Peak mem/GPU	~10.2 GB	similar or lower (smaller batch per rank)
+10-min val_bpb	1.2244	will see fewer steps → higher BPB
+Score (leaderboard)	this IS the baseline	not a valid leaderboard entry (requires 8xH100)
+Key caveat: The challenge rules require final leaderboard submissions to run on 8×H100 SXM under 10 min. The 2×5090 run is for local iteration/research only — not a valid record submission.
+
+Tips for 5090
+Flash Attention is already enabled (enable_flash_sdp(True)) — the 5090 with Blackwell architecture needs PyTorch ≥ 2.7 or a build with FA3 support. Check: python -c "import torch; print(torch.__version__)".
+
+torch.compile is on by default (COMPILE_MODEL=1). First run will be slow (~10 min compile overhead). For quick smoke tests: COMPILE_MODEL=0.
+
+Longer uncapped runs: The max_wallclock_seconds=600 cap means the 2×5090 will stop at fewer steps. To explore quality: MAX_WALLCLOCK_SECONDS=0 (unlimited, runs all 20,000 iters).
+
+Memory: Each rank gets train_batch_tokens / (world_size * grad_accum_steps) = 524288 / (2*4) = 65536 tokens = 64 sequences of 1024 — well within 24GB VRAM.
